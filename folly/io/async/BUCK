@@ -985,3 +985,75 @@ fb_dirsync_cpp_library(
         "//folly/io/async:liburing",
     ],
 )
+
+fb_dirsync_cpp_library(
+    name = "gqm_interface",
+    srcs = [
+        "GqmInterface.cpp",
+    ],
+    headers = [
+        "GqmInterface.h",
+    ],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    exported_deps = [
+        "//folly:optional",
+        "//folly/portability:portability",
+    ],
+)
+
+fb_dirsync_cpp_library(
+    name = "shared_memory_region",
+    srcs = [
+        "SharedMemoryRegion.cpp",
+    ],
+    headers = [
+        "SharedMemoryRegion.h",
+    ],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "//folly:format",
+        "//folly:scope_guard",
+        "//folly/io:iobuf",
+    ],
+    exported_deps = [
+        "//folly:optional",
+        "//folly:portability",
+        ":gqm_interface",
+    ],
+    exported_external_deps = [
+        "glog",
+    ],
+)
+
+fb_dirsync_cpp_library(
+    name = "shared_memory_transport",
+    srcs = [
+        "SharedMemoryTransport.cpp",
+    ],
+    headers = [
+        "SharedMemoryTransport.h",
+    ],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "//folly:exception",
+        "//folly:exception_wrapper",
+        "//folly:format",
+        "//folly:scope_guard",
+        "//folly/io:iobuf",
+        ":shared_memory_region",
+    ],
+    exported_deps = [
+        "//folly:optional",
+        "//folly:portability",
+        "//folly/io/async:async_base",
+        "//folly/io/async:async_transport",
+    ],
+    exported_external_deps = [
+        "glog",
+    ],
+)
