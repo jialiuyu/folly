@@ -54,8 +54,13 @@ struct SharedMemoryRegionHeader {
   uint64_t dataSize{0};
   // Flags for state synchronization
   std::atomic<uint64_t> flags{0};
-  // Reserved for future use
-  uint8_t reserved[24]{};
+  // Eventfd file descriptor for writer-to-reader notification.
+  // The reader creates an eventfd and stores its fd here.
+  // The writer signals this eventfd after writing data.
+  // -1 means no eventfd notification is set up.
+  std::atomic<int32_t> readerEventFd{-1};
+  // Padding to maintain 64-byte header alignment
+  uint8_t reserved[20]{};
 
   // Flag values
   static constexpr uint64_t kFlagClosed = 1 << 0;
@@ -156,6 +161,18 @@ class SharedMemoryRegion {
    * Get the file descriptor for the shared memory
    */
   int fd() const { return fd_; }
+
+  /**
+   * Set the eventfd that the writer should signal after writing data.
+   * This is called by the reader of this region.
+   */
+  void setReaderEventFd(int fd);
+
+  /**
+   * Get the eventfd that the writer should signal after writing data.
+   * Returns -1 if no eventfd is set.
+   */
+  int getReaderEventFd() const;
 
  private:
   SharedMemoryRegion(

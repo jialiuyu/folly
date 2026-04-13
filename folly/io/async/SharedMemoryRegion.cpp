@@ -228,6 +228,14 @@ void SharedMemoryRegion::close() {
   header_->setClosed();
 }
 
+void SharedMemoryRegion::setReaderEventFd(int fd) {
+  header_->readerEventFd.store(fd, std::memory_order_release);
+}
+
+int SharedMemoryRegion::getReaderEventFd() const {
+  return header_->readerEventFd.load(std::memory_order_acquire);
+}
+
 // ========== DefaultGqmInterface Implementation ==========
 
 void DefaultGqmInterface::push(const GqmNotification& notification) {
