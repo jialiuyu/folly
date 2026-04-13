@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfollybenchmark.a CMakeFiles/follybenchmark.dir/Benchmark.cpp.o
+/usr/bin/ranlib libfollybenchmark.a
