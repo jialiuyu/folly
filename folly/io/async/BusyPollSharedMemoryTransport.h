@@ -32,108 +32,74 @@
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/GqmInterface.h>
-#include <folly/io/async/SharedMemoryRegion.h>
+#include <folly/io/async/MemoryProvider.h>
 
 namespace folly {
 
 /**
- * BusyPollSharedMemoryTransport implements AsyncTransport using shared memory
- * with GQM-based notification for ultra-low-latency inter-process
- * communication.
+ * BusyPollSharedMemoryTransport implements AsyncTransport over shared memory
+ * with GQM-based ring-queue notification for ultra-low-latency IPC.
  *
- * Communication Model:
- * - Bidirectional communication uses two pairs of (data region + GQM queue):
- *   1. Write side: data writeRegion + gqmWrite (we push, peer pops)
- *   2. Read side:  data readRegion  + gqmRead  (peer pushes, we pop)
+ * Communication model (per direction):
+ *   MemoryRegion  – flat data buffer (no internal ring-buffer logic)
+ *   GqmInterface  – ring queue of (offset, length) descriptors
  *
- * - Notification mechanism:
- *   After writing data to the shared memory, gqm_push() sends a notification
- *   with (offset, length). The reader polls gqm_pop() to detect new data.
- *   Both push and pop are pure user-space atomic operations — zero syscall.
+ * The writer splits each write into ≤ kMaxChunkSize chunks, copies them
+ * into the data region at a locally-maintained writeCursor, and pushes
+ * one GQM descriptor per chunk.  The reader pops GQM descriptors and
+ * copies the referenced bytes out of the data region.
  *
- * - Polling strategy:
- *   Configurable via PollingMode:
- *   - BUSY_POLL:    Dedicated thread spins on gqm_pop (lowest latency)
- *   - ADAPTIVE:     NAPI-style hybrid: spin under load, sleep when idle
- *   - DEDICATED_CORE: Like BUSY_POLL but pinned to a specific CPU core
- *   - EVENTBASE:    No extra thread; checked via EventBase loop callback
- *
- * Usage:
- *   auto transport = BusyPollSharedMemoryTransport::create(
- *       evb, std::move(writeRegion), std::move(readRegion),
- *       std::move(gqmWrite), std::move(gqmRead), config);
+ * Flow control: dataRegionSize >= gqmDepth * maxChunkSize guarantees
+ * that as long as GQM push succeeds, the data region will not be
+ * over-written.  When GQM is full the writer blocks (backpressure).
  */
 class BusyPollSharedMemoryTransport : public AsyncTransport {
  public:
   using UniquePtr = std::unique_ptr<BusyPollSharedMemoryTransport, Destructor>;
 
-  /**
-   * Polling strategy mode.
-   */
   enum class PollingMode {
-    /// Pure busy-poll: dedicated thread spins on gqm_pop. Lowest latency.
     BUSY_POLL,
-    /// NAPI-style adaptive: spin under high load, futex_wait when idle.
     ADAPTIVE,
-    /// Dedicated core: busy-poll pinned to a specific CPU core.
     DEDICATED_CORE,
-    /// No extra thread; GQM checked via EventBase runInLoop callback.
     EVENTBASE,
   };
 
-  /**
-   * Configuration for BusyPollSharedMemoryTransport.
-   */
   struct Config {
-    // Size of each shared memory data region (default: 4MB)
     size_t dataRegionSize = 4 * 1024 * 1024;
-    // Name prefix for shared memory regions
     std::string shmNamePrefix = "/thrift_shm_";
-    // Polling mode
     PollingMode pollingMode = PollingMode::ADAPTIVE;
-    // CPU core to pin for DEDICATED_CORE mode (-1 = no pinning)
     int pinnedCore = -1;
 
-    // --- Adaptive polling parameters (ADAPTIVE mode only) ---
-    // Max spin iterations before falling back to sleep
     uint32_t spinLimit = 1000;
-    // Consecutive hits threshold to stay in spin mode
     uint32_t highLoadThreshold = 10;
-    // futex_wait timeout in microseconds when sleeping
     uint32_t sleepTimeoutUs = 100;
 
-    // Enable debug logging
+    uint32_t maxChunkSize = GqmNotification::kMaxChunkSize;
+
+    std::shared_ptr<MemoryProvider> memoryProvider;
+
     bool debugLogging = false;
   };
 
   /**
-   * Create a BusyPollSharedMemoryTransport from established shared memory
-   * regions and GQM queues. Called after the handshake completes.
-   *
-   * @param evb EventBase to use for async operations
-   * @param writeRegion Data region to write to (read by peer)
-   * @param readRegion Data region to read from (written by peer)
-   * @param gqmWrite GQM queue for write notifications (we push, peer pops)
-   * @param gqmRead GQM queue for read notifications (peer pushes, we pop)
-   * @param config Configuration
+   * Create from pre-established memory regions and GQM queues (after
+   * the handshake completes).
    */
   static UniquePtr create(
       EventBase* evb,
-      std::unique_ptr<SharedMemoryRegion> writeRegion,
-      std::unique_ptr<SharedMemoryRegion> readRegion,
+      std::unique_ptr<MemoryRegion> writeDataRegion,
+      std::unique_ptr<MemoryRegion> readDataRegion,
       std::unique_ptr<GqmInterface> gqmWrite,
       std::unique_ptr<GqmInterface> gqmRead,
       const Config& config = {});
 
   ~BusyPollSharedMemoryTransport() override;
 
-  // Non-copyable, non-movable
   BusyPollSharedMemoryTransport(const BusyPollSharedMemoryTransport&) = delete;
-  BusyPollSharedMemoryTransport& operator=(const BusyPollSharedMemoryTransport&) =
-      delete;
+  BusyPollSharedMemoryTransport& operator=(
+      const BusyPollSharedMemoryTransport&) = delete;
 
-  // ========== AsyncTransport Interface Implementation ==========
-
+  // ========== AsyncTransport interface ==========
   void setReadCB(ReadCallback* callback) override;
   ReadCallback* getReadCallback() const override;
 
@@ -182,28 +148,12 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   size_t getAppBytesReceived() const override { return bytesRead_; }
   size_t getRawBytesReceived() const override { return bytesRead_; }
 
-  // ========== BusyPollSharedMemoryTransport Specific Methods ==========
-
-  /**
-   * Manually trigger a check for available data via GQM.
-   */
+  // ========== SHM-specific ==========
   void checkForAvailableData();
-
-  /**
-   * Check GQM for notifications and deliver data if available.
-   * Called by the poller thread or by EventBase loop callback.
-   * Returns true if data was delivered.
-   */
   bool pollAndDeliver();
 
-  /**
-   * Get the GQM read interface (for external poller integration).
-   */
   GqmInterface* getGqmRead() { return gqmRead_.get(); }
 
-  /**
-   * Get statistics
-   */
   struct Stats {
     uint64_t bytesWritten{0};
     uint64_t bytesRead{0};
@@ -217,71 +167,55 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   Stats getStats() const;
 
  private:
-  // Private constructor - use create() factory
   BusyPollSharedMemoryTransport(
       EventBase* evb,
-      std::unique_ptr<SharedMemoryRegion> writeRegion,
-      std::unique_ptr<SharedMemoryRegion> readRegion,
+      std::unique_ptr<MemoryRegion> writeDataRegion,
+      std::unique_ptr<MemoryRegion> readDataRegion,
       std::unique_ptr<GqmInterface> gqmWrite,
       std::unique_ptr<GqmInterface> gqmRead,
       const Config& config);
 
-  // Internal methods
   void writeInternal(
       WriteCallback* callback,
       std::unique_ptr<IOBuf> buf,
       WriteFlags flags);
   void deliverReadData();
-  void signalPeer();
 
-  // Poller thread management
   void startPollerThread();
   void stopPollerThread();
 
-  // Polling strategies
   void pollerLoopBusyPoll();
   void pollerLoopAdaptive();
   void pollerLoopDedicatedCore();
 
-  // EventBase-integrated polling
   void registerEventBasePoll();
   void unregisterEventBasePoll();
 
-  // Wakeup fd helpers for adaptive mode
-  // On Linux uses eventfd; on other platforms uses pipe.
-  // createWakeupFds populates readFd and writeFd.
-  // On Linux readFd == writeFd (eventfd is bidirectional).
   static void createWakeupFds(int& readFd, int& writeFd);
   static void closeEventFd(int fd);
   static bool writeEventFd(int fd);
   static bool drainEventFd(int fd);
 
-  // State
-  enum class State {
-    CONNECTED, // Shared memory established, ready for I/O
-    CLOSING, // Close requested, draining writes
-    CLOSED, // Fully closed
-    ERROR // Error state
-  };
+  enum class State { CONNECTED, CLOSING, CLOSED, ERROR };
 
   EventBase* evb_;
   std::atomic<State> state_{State::CONNECTED};
 
-  // Shared memory data regions
-  std::unique_ptr<SharedMemoryRegion> writeRegion_; // We write, peer reads
-  std::unique_ptr<SharedMemoryRegion> readRegion_; // Peer writes, we read
+  // Flat data regions (no internal ring-buffer logic)
+  std::unique_ptr<MemoryRegion> writeDataRegion_;
+  std::unique_ptr<MemoryRegion> readDataRegion_;
 
-  // GQM notification queues (pure user-space, no syscall)
-  std::unique_ptr<GqmInterface> gqmWrite_; // We push, peer pops
-  std::unique_ptr<GqmInterface> gqmRead_; // Peer pushes, we pop
+  // GQM ring queues carry (offset, length) descriptors
+  std::unique_ptr<GqmInterface> gqmWrite_;
+  std::unique_ptr<GqmInterface> gqmRead_;
 
-  // Configuration
   Config config_;
 
-  // Read callback
+  // Writer-local cursor (not shared; only the writer advances it)
+  uint64_t writeCursor_{0};
+
   ReadCallback* readCallback_{nullptr};
 
-  // Write state
   struct WriteRequest {
     WriteCallback* callback{nullptr};
     std::unique_ptr<IOBuf> buffer;
@@ -291,20 +225,15 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   std::deque<WriteRequest> pendingWrites_;
   mutable std::mutex writeMutex_;
 
-  // Read state
   IOBufQueue readBufQueue_;
 
-  // Poller thread (for BUSY_POLL, ADAPTIVE, DEDICATED_CORE modes)
   std::thread pollerThread_;
   std::atomic<bool> pollerRunning_{false};
 
-  // Adaptive mode: eventfd for waking poller from sleep
-  // (only used in ADAPTIVE mode, -1 in other modes)
-  int wakeupFd_{-1}; // read end (eventfd on Linux, pipe read on others)
-  int wakeupFdWrite_{-1}; // write end (same as wakeupFd_ on Linux, pipe write on others)
+  int wakeupFd_{-1};
+  int wakeupFdWrite_{-1};
   std::atomic<bool> pollerSleeping_{false};
 
-  // EventBase-integrated polling (EVENTBASE mode)
   class PollLoopCallback : public EventBase::LoopCallback {
    public:
     explicit PollLoopCallback(BusyPollSharedMemoryTransport& transport)
@@ -316,7 +245,6 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   std::unique_ptr<PollLoopCallback> pollLoopCb_;
   bool evbPollRegistered_{false};
 
-  // Statistics
   std::atomic<uint64_t> bytesWritten_{0};
   std::atomic<uint64_t> bytesRead_{0};
   std::atomic<uint64_t> writeCount_{0};
@@ -326,12 +254,10 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   std::atomic<uint64_t> pollCycles_{0};
   std::atomic<uint64_t> sleepCount_{0};
 
-  // Other state
   uint32_t sendTimeoutMs_{0};
   bool eorTrackingEnabled_{false};
   folly::Function<void()> closeCallback_;
 
-  // Cached addresses
   mutable SocketAddress localAddress_;
   mutable SocketAddress peerAddress_;
 };

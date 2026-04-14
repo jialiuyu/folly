@@ -23,26 +23,26 @@
 #include <folly/Format.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/async/PosixShmProvider.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
 
 namespace {
 
-constexpr uint32_t kHandshakeVersion = 1;
-constexpr size_t kFrameHeaderSize = 4; // uint32_t length prefix
+constexpr uint32_t kHandshakeVersion = 2; // v2: added maxChunkSize field
+constexpr size_t kFrameHeaderSize = 4;
 
-// Compute the payload size for a handshake message (excluding length prefix).
 size_t handshakePayloadSize(const ShmHandshakeInfo& info) {
   return 4 + // magic
       4 + // version
-      4 + info.writeShmName.size() + // name len + name
+      4 + info.writeShmName.size() +
       8 + // dataRegionSize
-      4 + info.gqmWriteName.size() + // gqm name len + name
-      4; // gqmQueueDepth
+      4 + info.gqmWriteName.size() +
+      4 + // gqmQueueDepth
+      4; // maxChunkSize
 }
 
-// Serialize handshake info to IOBuf with a 4-byte length prefix frame.
 std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
   size_t payloadSize = handshakePayloadSize(info);
   auto buf = IOBuf::create(kFrameHeaderSize + payloadSize);
@@ -61,11 +61,11 @@ std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
       reinterpret_cast<const uint8_t*>(info.gqmWriteName.data()),
       info.gqmWriteName.size());
   appender.writeBE<uint32_t>(info.gqmQueueDepth);
+  appender.writeBE<uint32_t>(info.maxChunkSize);
 
   return buf;
 }
 
-// Deserialize handshake info from IOBuf (length prefix already consumed).
 bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
   io::Cursor cursor(buf);
 
@@ -76,7 +76,7 @@ bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
   }
 
   auto version = cursor.readBE<uint32_t>();
-  if (version != kHandshakeVersion) {
+  if (version < 1 || version > kHandshakeVersion) {
     XLOG(ERR) << "Unsupported handshake version: " << version;
     return false;
   }
@@ -101,17 +101,23 @@ bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
 
   info.gqmQueueDepth = cursor.readBE<uint32_t>();
 
+  if (version >= 2) {
+    info.maxChunkSize = cursor.readBE<uint32_t>();
+  } else {
+    info.maxChunkSize = GqmNotification::kMaxChunkSize;
+  }
+
   return true;
 }
 
-// Generate a unique shm name using PID + timestamp to avoid collisions.
 std::string generateShmName(
     const std::string& prefix, bool isServer, uint64_t id) {
   return folly::sformat(
       "{}{}_{:x}_{}", prefix, isServer ? "s" : "c", id, ::getpid());
 }
 
-// Synchronous write on a socket (for handshake)
+// ---- Synchronous socket helpers (handshake only) ----
+
 bool syncWrite(
     EventBase* evb,
     AsyncTransport* sock,
@@ -145,7 +151,6 @@ bool syncWrite(
   return true;
 }
 
-// Synchronous read from a socket (for handshake)
 bool syncRead(
     EventBase* evb,
     AsyncTransport* sock,
@@ -154,17 +159,14 @@ bool syncRead(
   class SyncReadCallback : public AsyncTransport::ReadCallback {
    public:
     explicit SyncReadCallback(IOBufQueue& q) : queue_(q) {}
-
     void getReadBuffer(void** bufReturn, size_t* lenReturn) override {
       auto buf = queue_.preallocate(4096, 4096);
       *bufReturn = buf.first;
       *lenReturn = buf.second;
     }
-
     void readDataAvailable(size_t len) noexcept override {
       queue_.postallocate(len);
     }
-
     void readEOF() noexcept override { eof_ = true; }
     void readErr(const AsyncSocketException& ex) noexcept override {
       error_ = ex.what();
@@ -174,7 +176,6 @@ bool syncRead(
         std::unique_ptr<IOBuf> readBuf) noexcept override {
       queue_.append(std::move(readBuf));
     }
-
     IOBufQueue& queue_;
     std::atomic<bool> eof_{false};
     std::string error_;
@@ -202,14 +203,12 @@ bool syncRead(
   return queue.chainLength() >= minBytes;
 }
 
-// Read a length-prefixed framed handshake message and deserialize it.
 bool readFramedHandshake(
     EventBase* evb,
     AsyncTransport* sock,
     ShmHandshakeInfo& info) {
   IOBufQueue readQueue;
 
-  // Read the 4-byte length prefix
   if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
     XLOG(ERR) << "Failed to read handshake frame header";
     return false;
@@ -222,7 +221,6 @@ bool readFramedHandshake(
     return false;
   }
 
-  // Read the full payload
   size_t totalNeeded = kFrameHeaderSize + payloadLen;
   if (readQueue.chainLength() < totalNeeded) {
     if (!syncRead(evb, sock, readQueue, totalNeeded)) {
@@ -231,10 +229,18 @@ bool readFramedHandshake(
     }
   }
 
-  // Skip past the 4-byte length prefix for deserialization
   readQueue.trimStart(kFrameHeaderSize);
   auto payloadBuf = readQueue.move();
   return deserializeHandshakeInfo(payloadBuf.get(), info);
+}
+
+MemoryProvider& resolveProvider(
+    const BusyPollSharedMemoryTransport::Config& config) {
+  static PosixShmProvider defaultProvider;
+  if (config.memoryProvider) {
+    return *config.memoryProvider;
+  }
+  return defaultProvider;
 }
 
 } // namespace
@@ -245,10 +251,11 @@ ShmHandshakeResult shmHandshakeClient(
     EventBase* evb,
     AsyncTransport* sock,
     const BusyPollSharedMemoryTransport::Config& config) {
+  auto& provider = resolveProvider(config);
+
   uint64_t uniqueId = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
 
-  // Step 1: Create our handshake info
   ShmHandshakeInfo myInfo;
   myInfo.writeShmName =
       generateShmName(config.shmNamePrefix, false, uniqueId);
@@ -256,36 +263,33 @@ ShmHandshakeResult shmHandshakeClient(
   myInfo.gqmWriteName =
       generateShmName("/thrift_gqm_", false, uniqueId);
   myInfo.gqmQueueDepth = SharedMemoryGqm::kDefaultQueueDepth;
+  myInfo.maxChunkSize = config.maxChunkSize;
 
-  // Step 2: Send our handshake info
   auto sendBuf = serializeHandshakeInfo(myInfo);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error("Client handshake: failed to send info");
   }
 
-  // Step 3: Receive peer's handshake info (length-prefixed frame)
   ShmHandshakeInfo peerInfo;
   if (!readFramedHandshake(evb, sock, peerInfo)) {
     throw std::runtime_error("Client handshake: failed to read peer info");
   }
 
-  // Step 4: Create shared memory data regions
-  auto writeRegion = SharedMemoryRegion::create(
-      myInfo.writeShmName, config.dataRegionSize, true);
-  auto readRegion = SharedMemoryRegion::create(
-      peerInfo.writeShmName, peerInfo.dataRegionSize, false);
+  auto writeRegion =
+      provider.create(myInfo.writeShmName, config.dataRegionSize);
+  auto readRegion =
+      provider.import(peerInfo.writeShmName, peerInfo.dataRegionSize);
 
-  // Step 5: Create GQM queues
   auto gqmWrite = SharedMemoryGqm::create(
       myInfo.gqmWriteName, myInfo.gqmQueueDepth);
   auto gqmRead = SharedMemoryGqm::open(
       peerInfo.gqmWriteName, peerInfo.gqmQueueDepth);
 
-  // Step 6: Close the handshake socket
   sock->close();
 
   XLOG(DBG5) << "Client handshake complete: writeRegion="
-            << myInfo.writeShmName << ", gqmWrite=" << myInfo.gqmWriteName;
+             << myInfo.writeShmName
+             << ", maxChunkSize=" << myInfo.maxChunkSize;
 
   return ShmHandshakeResult{
       std::move(writeRegion),
@@ -300,16 +304,16 @@ ShmHandshakeResult shmHandshakeServer(
     EventBase* evb,
     AsyncTransport* sock,
     const BusyPollSharedMemoryTransport::Config& config) {
+  auto& provider = resolveProvider(config);
+
   uint64_t uniqueId = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
 
-  // Step 1: Receive client's handshake info (length-prefixed frame)
   ShmHandshakeInfo clientInfo;
   if (!readFramedHandshake(evb, sock, clientInfo)) {
     throw std::runtime_error("Server handshake: failed to read client info");
   }
 
-  // Step 2: Create our handshake info
   ShmHandshakeInfo myInfo;
   myInfo.writeShmName =
       generateShmName(config.shmNamePrefix, true, uniqueId);
@@ -317,30 +321,28 @@ ShmHandshakeResult shmHandshakeServer(
   myInfo.gqmWriteName =
       generateShmName("/thrift_gqm_", true, uniqueId);
   myInfo.gqmQueueDepth = SharedMemoryGqm::kDefaultQueueDepth;
+  myInfo.maxChunkSize = config.maxChunkSize;
 
-  // Step 3: Send our handshake info
   auto sendBuf = serializeHandshakeInfo(myInfo);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error("Server handshake: failed to send info");
   }
 
-  // Step 4: Create shared memory data regions
-  auto writeRegion = SharedMemoryRegion::create(
-      myInfo.writeShmName, config.dataRegionSize, true);
-  auto readRegion = SharedMemoryRegion::create(
-      clientInfo.writeShmName, clientInfo.dataRegionSize, false);
+  auto writeRegion =
+      provider.create(myInfo.writeShmName, config.dataRegionSize);
+  auto readRegion =
+      provider.import(clientInfo.writeShmName, clientInfo.dataRegionSize);
 
-  // Step 5: Create GQM queues
   auto gqmWrite = SharedMemoryGqm::create(
       myInfo.gqmWriteName, myInfo.gqmQueueDepth);
   auto gqmRead = SharedMemoryGqm::open(
       clientInfo.gqmWriteName, clientInfo.gqmQueueDepth);
 
-  // Step 6: Close the handshake socket
   sock->close();
 
   XLOG(DBG5) << "Server handshake complete: writeRegion="
-            << myInfo.writeShmName << ", gqmWrite=" << myInfo.gqmWriteName;
+             << myInfo.writeShmName
+             << ", maxChunkSize=" << myInfo.maxChunkSize;
 
   return ShmHandshakeResult{
       std::move(writeRegion),

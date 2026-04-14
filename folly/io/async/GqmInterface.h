@@ -26,12 +26,18 @@
 namespace folly {
 
 /**
- * GQM (Hardware Queue) notification message structure.
- * The message is 64 bits total: 32-bit offset + 32-bit length.
+ * GQM descriptor: 64 bits encoding (offset:32 | length:32).
+ *
+ * In the ring-queue model, each GQM entry IS one data chunk descriptor
+ * pointing into the flat shared memory data region.  GQM's internal
+ * atomic push/pop provides ordering and flow control, so the data region
+ * itself needs no writeOffset/readOffset management.
  */
 struct GqmNotification {
-  uint32_t offset; // Offset in shared memory where data starts
-  uint32_t length; // Length of data written
+  uint32_t offset; // Byte offset into the data region
+  uint32_t length; // Chunk length in bytes
+
+  static constexpr uint32_t kMaxChunkSize = 64 * 1024; // 64 KB
 
   uint64_t toUint64() const {
     return (static_cast<uint64_t>(offset) << 32) | length;
@@ -45,12 +51,12 @@ struct GqmNotification {
 };
 
 /**
- * GQM (Hardware Queue) interface for notification.
- * This is an abstract interface that should be implemented by the actual
- * hardware queue mechanism.
+ * Abstract GQM ring-queue interface.
  *
- * See DefaultGqmInterface for the reference implementation using external
- * C functions, or SharedMemoryGqm for a POSIX shm-backed implementation.
+ * In the SHM transport, GQM serves as the primary data ring queue:
+ * push/pop of uint64 descriptors (offset+length) provides ordering and
+ * backpressure.  The underlying implementation may be a hardware queue
+ * (DefaultGqmInterface) or a software POSIX-shm queue (SharedMemoryGqm).
  */
 class GqmInterface {
  public:

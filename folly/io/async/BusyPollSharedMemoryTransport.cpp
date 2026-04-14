@@ -37,7 +37,7 @@
 
 namespace folly {
 
-// ========== Platform-specific eventfd helpers (for ADAPTIVE mode wakeup) ==========
+// ========== Platform wakeup-fd helpers ==========
 
 void BusyPollSharedMemoryTransport::createWakeupFds(
     int& readFd, int& writeFd) {
@@ -99,24 +99,25 @@ bool BusyPollSharedMemoryTransport::drainEventFd(int fd) {
   return true;
 }
 
-// ========== BusyPollSharedMemoryTransport Implementation ==========
+// ========== Construction / Destruction ==========
 
 BusyPollSharedMemoryTransport::BusyPollSharedMemoryTransport(
     EventBase* evb,
-    std::unique_ptr<SharedMemoryRegion> writeRegion,
-    std::unique_ptr<SharedMemoryRegion> readRegion,
+    std::unique_ptr<MemoryRegion> writeDataRegion,
+    std::unique_ptr<MemoryRegion> readDataRegion,
     std::unique_ptr<GqmInterface> gqmWrite,
     std::unique_ptr<GqmInterface> gqmRead,
     const Config& config)
     : evb_(evb),
-      writeRegion_(std::move(writeRegion)),
-      readRegion_(std::move(readRegion)),
+      writeDataRegion_(std::move(writeDataRegion)),
+      readDataRegion_(std::move(readDataRegion)),
       gqmWrite_(std::move(gqmWrite)),
       gqmRead_(std::move(gqmRead)),
       config_(config) {
   state_ = State::CONNECTED;
   XLOG(DBG5) << "BusyPollSharedMemoryTransport created, mode="
-             << static_cast<int>(config_.pollingMode);
+             << static_cast<int>(config_.pollingMode)
+             << ", chunkSize=" << config_.maxChunkSize;
 }
 
 BusyPollSharedMemoryTransport::~BusyPollSharedMemoryTransport() {
@@ -124,30 +125,29 @@ BusyPollSharedMemoryTransport::~BusyPollSharedMemoryTransport() {
   XLOG(DBG5) << "BusyPollSharedMemoryTransport destroyed";
 }
 
-// ========== Static Factory Method ==========
+// ========== Factory ==========
 
 BusyPollSharedMemoryTransport::UniquePtr
 BusyPollSharedMemoryTransport::create(
     EventBase* evb,
-    std::unique_ptr<SharedMemoryRegion> writeRegion,
-    std::unique_ptr<SharedMemoryRegion> readRegion,
+    std::unique_ptr<MemoryRegion> writeDataRegion,
+    std::unique_ptr<MemoryRegion> readDataRegion,
     std::unique_ptr<GqmInterface> gqmWrite,
     std::unique_ptr<GqmInterface> gqmRead,
     const Config& config) {
-  if (!writeRegion || !readRegion || !gqmWrite || !gqmRead) {
+  if (!writeDataRegion || !readDataRegion || !gqmWrite || !gqmRead) {
     throw std::invalid_argument(
         "Write/read regions and GQM queues must not be null");
   }
 
   auto transport = UniquePtr(new BusyPollSharedMemoryTransport(
       evb,
-      std::move(writeRegion),
-      std::move(readRegion),
+      std::move(writeDataRegion),
+      std::move(readDataRegion),
       std::move(gqmWrite),
       std::move(gqmRead),
       config));
 
-  // Start the appropriate polling mode
   switch (config.pollingMode) {
     case PollingMode::BUSY_POLL:
       transport->startPollerThread();
@@ -167,13 +167,11 @@ BusyPollSharedMemoryTransport::create(
   return transport;
 }
 
-// ========== AsyncTransport Interface ==========
+// ========== AsyncTransport read ==========
 
 void BusyPollSharedMemoryTransport::setReadCB(ReadCallback* callback) {
   readCallback_ = callback;
-
   if (callback && state_ == State::CONNECTED) {
-    // Deliver any pending data immediately
     deliverReadData();
   }
 }
@@ -182,6 +180,8 @@ AsyncTransport::ReadCallback*
 BusyPollSharedMemoryTransport::getReadCallback() const {
   return readCallback_;
 }
+
+// ========== AsyncTransport write ==========
 
 void BusyPollSharedMemoryTransport::write(
     WriteCallback* callback,
@@ -226,85 +226,148 @@ void BusyPollSharedMemoryTransport::writeChain(
     }
     return;
   }
-
   writeInternal(callback, std::move(buf), flags);
 }
+
+// ========== Core write: chunk + GQM push ==========
 
 void BusyPollSharedMemoryTransport::writeInternal(
     WriteCallback* callback,
     std::unique_ptr<IOBuf> buf,
     WriteFlags /*flags*/) {
-  if (!writeRegion_ || writeRegion_->isClosed()) {
+  if (!writeDataRegion_) {
     if (callback) {
       callback->writeErr(
           0,
           AsyncSocketException(
-              AsyncSocketException::END_OF_FILE, "Write region closed"));
+              AsyncSocketException::END_OF_FILE, "Write region unavailable"));
     }
     return;
   }
 
-  size_t bytesWritten = 0;
+  const size_t regionSize = writeDataRegion_->size();
+  char* regionBase = static_cast<char*>(writeDataRegion_->data());
+  size_t totalWritten = 0;
 
   for (auto& iov : *buf) {
-    ssize_t written = writeRegion_->write(iov.data(), iov.size());
-    if (written < 0) {
-      if (callback) {
-        callback->writeErr(
-            bytesWritten,
-            AsyncSocketException(
-                AsyncSocketException::UNKNOWN, "Write failed"));
-      }
-      state_ = State::ERROR;
-      return;
-    }
-    bytesWritten += written;
+    const uint8_t* src = iov.data();
+    size_t remaining = iov.size();
 
-    if (static_cast<size_t>(written) < iov.size()) {
-      XLOG(DBG3) << "Partial write: " << written << "/" << iov.size();
-      if (callback) {
-        callback->writeErr(
-            bytesWritten,
-            AsyncSocketException(
-                AsyncSocketException::UNKNOWN, "Shared memory buffer full"));
+    while (remaining > 0) {
+      size_t chunkLen =
+          std::min(remaining, static_cast<size_t>(config_.maxChunkSize));
+      uint32_t offset =
+          static_cast<uint32_t>(writeCursor_ % regionSize);
+
+      size_t firstPart = std::min(chunkLen, regionSize - offset);
+      std::memcpy(regionBase + offset, src, firstPart);
+      if (firstPart < chunkLen) {
+        std::memcpy(regionBase, src + firstPart, chunkLen - firstPart);
       }
-      return;
+
+      gqmWrite_->push(
+          {offset, static_cast<uint32_t>(chunkLen)});
+      gqmPushCount_++;
+
+      writeCursor_ += chunkLen;
+      src += chunkLen;
+      remaining -= chunkLen;
+      totalWritten += chunkLen;
     }
   }
 
-  bytesWritten_ += bytesWritten;
+  bytesWritten_ += totalWritten;
   writeCount_++;
-
-  // Notify peer via GQM (pure user-space, zero syscall)
-  signalPeer();
 
   if (callback) {
     callback->writeSuccess();
   }
 }
 
-void BusyPollSharedMemoryTransport::signalPeer() {
-  if (gqmWrite_) {
-    uint64_t writeOff =
-        writeRegion_->header()->writeOffset.load(std::memory_order_acquire);
-    uint32_t offset =
-        static_cast<uint32_t>(writeOff % writeRegion_->dataSize());
-    uint32_t len =
-        static_cast<uint32_t>(writeCount_.load(std::memory_order_relaxed));
-    gqmWrite_->push({offset, len});
-    gqmPushCount_++;
+// ========== Core read: GQM pop → data region → readCallback ==========
+
+bool BusyPollSharedMemoryTransport::pollAndDeliver() {
+  if (!readDataRegion_) {
+    return false;
+  }
+
+  bool hasData = false;
+  const size_t regionSize = readDataRegion_->size();
+  const char* regionBase =
+      static_cast<const char*>(readDataRegion_->data());
+
+  while (auto notif = gqmRead_->pop()) {
+    gqmPopCount_++;
+    uint32_t offset = notif->offset;
+    uint32_t length = notif->length;
+
+    auto chunk = IOBuf::create(length);
+    size_t firstPart = std::min(
+        static_cast<size_t>(length), regionSize - offset);
+    std::memcpy(chunk->writableData(), regionBase + offset, firstPart);
+    if (firstPart < length) {
+      std::memcpy(
+          chunk->writableData() + firstPart,
+          regionBase,
+          length - firstPart);
+    }
+    chunk->append(length);
+    readBufQueue_.append(std::move(chunk));
+    hasData = true;
+  }
+
+  if (hasData) {
+    if (evb_ && evb_->isInEventBaseThread()) {
+      deliverReadData();
+    } else if (evb_) {
+      evb_->runInEventBaseThread([this]() {
+        if (state_ == State::CONNECTED && readCallback_) {
+          deliverReadData();
+        }
+      });
+    }
+  }
+
+  return hasData;
+}
+
+void BusyPollSharedMemoryTransport::deliverReadData() {
+  if (!readCallback_) {
+    return;
+  }
+
+  while (readBufQueue_.chainLength() > 0) {
+    void* buf = nullptr;
+    size_t bufLen = 0;
+    readCallback_->getReadBuffer(&buf, &bufLen);
+
+    if (!buf || bufLen == 0) {
+      readCallback_->readErr(AsyncSocketException(
+          AsyncSocketException::INVALID_STATE, "Invalid read buffer"));
+      return;
+    }
+
+    auto data = readBufQueue_.split(
+        std::min(bufLen, readBufQueue_.chainLength()));
+    size_t dataLen = data->computeChainDataLength();
+    std::memcpy(buf, data->data(), dataLen);
+
+    bytesRead_ += dataLen;
+    readCount_++;
+
+    readCallback_->readDataAvailable(dataLen);
   }
 }
+
+void BusyPollSharedMemoryTransport::checkForAvailableData() {
+  pollAndDeliver();
+}
+
+// ========== Lifecycle ==========
 
 void BusyPollSharedMemoryTransport::close() {
   State expected = State::CONNECTED;
   if (state_.compare_exchange_strong(expected, State::CLOSING)) {
-    if (writeRegion_) {
-      writeRegion_->close();
-    }
-    if (readRegion_) {
-      readRegion_->close();
-    }
     closeNow();
   }
 }
@@ -315,14 +378,9 @@ void BusyPollSharedMemoryTransport::closeNow() {
     return;
   }
 
-  // Stop poller thread
   stopPollerThread();
-
-  // Unregister EventBase polling
   unregisterEventBasePoll();
 
-  // Close wakeup fds (ADAPTIVE mode)
-  // On Linux, wakeupFd_ == wakeupFdWrite_ (same eventfd), avoid double-close.
   if (wakeupFdWrite_ >= 0 && wakeupFdWrite_ != wakeupFd_) {
     ::close(wakeupFdWrite_);
   }
@@ -330,15 +388,9 @@ void BusyPollSharedMemoryTransport::closeNow() {
   closeEventFd(wakeupFd_);
   wakeupFd_ = -1;
 
-  // Close shared memory regions
-  if (writeRegion_) {
-    writeRegion_->close();
-  }
-  if (readRegion_) {
-    readRegion_->close();
-  }
+  writeDataRegion_.reset();
+  readDataRegion_.reset();
 
-  // Fail any pending writes
   {
     std::lock_guard<std::mutex> lock(writeMutex_);
     for (auto& req : pendingWrites_) {
@@ -352,13 +404,11 @@ void BusyPollSharedMemoryTransport::closeNow() {
     pendingWrites_.clear();
   }
 
-  // Notify read callback of EOF
   if (readCallback_) {
     readCallback_->readEOF();
     readCallback_ = nullptr;
   }
 
-  // Call close callback
   if (closeCallback_) {
     closeCallback_();
   }
@@ -367,19 +417,11 @@ void BusyPollSharedMemoryTransport::closeNow() {
 }
 
 void BusyPollSharedMemoryTransport::closeWithReset() {
-  if (writeRegion_) {
-    writeRegion_->header()->setError();
-  }
-  if (readRegion_) {
-    readRegion_->header()->setError();
-  }
   closeNow();
 }
 
 void BusyPollSharedMemoryTransport::shutdownWrite() {
-  if (writeRegion_) {
-    writeRegion_->close();
-  }
+  writeDataRegion_.reset();
 }
 
 void BusyPollSharedMemoryTransport::shutdownWriteNow() {
@@ -391,11 +433,11 @@ bool BusyPollSharedMemoryTransport::good() const {
 }
 
 bool BusyPollSharedMemoryTransport::readable() const {
-  return good() && readRegion_ && readRegion_->availableToRead() > 0;
+  return good();
 }
 
 bool BusyPollSharedMemoryTransport::writable() const {
-  return good() && writeRegion_ && writeRegion_->availableToWrite() > 0;
+  return good() && writeDataRegion_;
 }
 
 bool BusyPollSharedMemoryTransport::connecting() const {
@@ -443,81 +485,10 @@ void BusyPollSharedMemoryTransport::getPeerAddress(
   *address = peerAddress_;
 }
 
-void BusyPollSharedMemoryTransport::checkForAvailableData() {
-  pollAndDeliver();
-}
-
-// ========== Core: poll GQM and deliver data ==========
-
-bool BusyPollSharedMemoryTransport::pollAndDeliver() {
-  bool hasNotification = false;
-
-  while (auto notif = gqmRead_->pop()) {
-    gqmPopCount_++;
-    hasNotification = true;
-  }
-
-  if (hasNotification || readRegion_->availableToRead() > 0) {
-    // Always deliver data on the EventBase thread for thread safety
-    if (evb_ && evb_->isInEventBaseThread()) {
-      deliverReadData();
-    } else if (evb_) {
-      evb_->runInEventBaseThread([this]() {
-        if (state_ == State::CONNECTED && readCallback_) {
-          deliverReadData();
-        }
-      });
-    }
-    return true;
-  }
-
-  return false;
-}
-
-void BusyPollSharedMemoryTransport::deliverReadData() {
-  if (!readCallback_ || !readRegion_) {
-    return;
-  }
-
-  while (size_t available = readRegion_->availableToRead()) {
-    void* buf = nullptr;
-    size_t bufLen = 0;
-    readCallback_->getReadBuffer(&buf, &bufLen);
-
-    if (!buf || bufLen == 0) {
-      readCallback_->readErr(
-          AsyncSocketException(
-              AsyncSocketException::INVALID_STATE, "Invalid read buffer"));
-      return;
-    }
-
-    size_t toRead = std::min(available, bufLen);
-    ssize_t bytesRead = readRegion_->read(buf, toRead);
-
-    if (bytesRead < 0) {
-      readCallback_->readErr(
-          AsyncSocketException(
-              AsyncSocketException::UNKNOWN, "Read failed"));
-      return;
-    }
-
-    if (bytesRead == 0) {
-      readCallback_->readEOF();
-      return;
-    }
-
-    bytesRead_ += bytesRead;
-    readCount_++;
-
-    readCallback_->readDataAvailable(bytesRead);
-  }
-}
-
-// ========== Poller Thread Management ==========
+// ========== Poller thread ==========
 
 void BusyPollSharedMemoryTransport::startPollerThread() {
   pollerRunning_ = true;
-
   switch (config_.pollingMode) {
     case PollingMode::BUSY_POLL:
       pollerThread_ = std::thread([this]() { pollerLoopBusyPoll(); });
@@ -535,7 +506,6 @@ void BusyPollSharedMemoryTransport::startPollerThread() {
 
 void BusyPollSharedMemoryTransport::stopPollerThread() {
   pollerRunning_.store(false, std::memory_order_release);
-  // Wake up poller if sleeping (ADAPTIVE mode)
   if (wakeupFdWrite_ >= 0) {
     writeEventFd(wakeupFdWrite_);
   }
@@ -560,11 +530,11 @@ void BusyPollSharedMemoryTransport::pollerLoopBusyPoll() {
   XLOG(DBG5) << "Busy-poll thread stopped";
 }
 
-// ========== Strategy B: NAPI-style Adaptive Hybrid ==========
+// ========== Strategy B: NAPI-style Adaptive ==========
 
 void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
-  XLOG(DBG5) << "Adaptive poller thread started (spin="
-             << config_.spinLimit << ", highLoad=" << config_.highLoadThreshold
+  XLOG(DBG5) << "Adaptive poller started (spin=" << config_.spinLimit
+             << ", highLoad=" << config_.highLoadThreshold
              << ", sleep=" << config_.sleepTimeoutUs << "us)";
 
   uint32_t consecutiveHits = 0;
@@ -572,7 +542,6 @@ void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
 
   while (pollerRunning_.load(std::memory_order_relaxed)) {
     pollCycles_++;
-
     bool found = pollAndDeliver();
 
     if (found) {
@@ -597,8 +566,8 @@ void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
         struct pollfd pfd;
         pfd.fd = wakeupFd_;
         pfd.events = POLLIN;
-        int timeoutMs = std::max(
-            1, static_cast<int>(config_.sleepTimeoutUs / 1000));
+        int timeoutMs =
+            std::max(1, static_cast<int>(config_.sleepTimeoutUs / 1000));
         ::poll(&pfd, 1, timeoutMs);
         drainEventFd(wakeupFd_);
       } else {
@@ -617,14 +586,13 @@ void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
     }
   }
 
-  XLOG(DBG5) << "Adaptive poller thread stopped";
+  XLOG(DBG5) << "Adaptive poller stopped";
 }
 
 // ========== Strategy C: Dedicated Core ==========
 
 void BusyPollSharedMemoryTransport::pollerLoopDedicatedCore() {
-  XLOG(DBG5) << "Dedicated core poller started, core="
-             << config_.pinnedCore;
+  XLOG(DBG5) << "Dedicated core poller started, core=" << config_.pinnedCore;
 
 #ifdef __linux__
   if (config_.pinnedCore >= 0) {
@@ -659,13 +627,13 @@ void BusyPollSharedMemoryTransport::pollerLoopDedicatedCore() {
 
 void BusyPollSharedMemoryTransport::PollLoopCallback::runLoopCallback()
     noexcept {
-  if (transport_.state_ != State::CONNECTED || !transport_.evbPollRegistered_) {
+  if (transport_.state_ != State::CONNECTED ||
+      !transport_.evbPollRegistered_) {
     return;
   }
   transport_.pollAndDeliver();
   if (transport_.evbPollRegistered_ &&
-      transport_.state_ == State::CONNECTED &&
-      transport_.evb_) {
+      transport_.state_ == State::CONNECTED && transport_.evb_) {
     transport_.evb_->runInLoop(this);
   }
 }
@@ -686,7 +654,7 @@ void BusyPollSharedMemoryTransport::unregisterEventBasePoll() {
   }
 }
 
-// ========== Statistics ==========
+// ========== Stats ==========
 
 BusyPollSharedMemoryTransport::Stats
 BusyPollSharedMemoryTransport::getStats() const {

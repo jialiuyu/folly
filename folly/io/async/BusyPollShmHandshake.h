@@ -21,7 +21,7 @@
 
 #include <folly/io/async/BusyPollSharedMemoryTransport.h>
 #include <folly/io/async/GqmInterface.h>
-#include <folly/io/async/SharedMemoryRegion.h>
+#include <folly/io/async/MemoryProvider.h>
 
 namespace folly {
 
@@ -29,44 +29,30 @@ namespace folly {
  * Result of a shared memory handshake.
  */
 struct ShmHandshakeResult {
-  std::unique_ptr<SharedMemoryRegion> writeRegion;
-  std::unique_ptr<SharedMemoryRegion> readRegion;
-  std::unique_ptr<GqmInterface> gqmWrite; // we push, peer pops
-  std::unique_ptr<GqmInterface> gqmRead; // peer pushes, we pop
+  std::unique_ptr<MemoryRegion> writeRegion;
+  std::unique_ptr<MemoryRegion> readRegion;
+  std::unique_ptr<GqmInterface> gqmWrite;
+  std::unique_ptr<GqmInterface> gqmRead;
 };
 
 /**
- * Shared memory handshake info exchanged between client and server.
+ * Info exchanged over the bootstrap socket during the SHM handshake.
  */
 struct ShmHandshakeInfo {
-  // Name of the shared memory data region that the sender will write to
   std::string writeShmName;
-  // Size of the data region
   uint64_t dataRegionSize{0};
-  // Name of the GQM queue that the sender will push to (reader pops)
   std::string gqmWriteName;
-  // Depth of the GQM queue
   uint32_t gqmQueueDepth{0};
-  // Magic number for validation
+  uint32_t maxChunkSize{0};
+
   static constexpr uint32_t kMagic = 0x53484D54; // "SHMT"
 };
 
 /**
- * Perform shared memory handshake on the client side.
+ * Client-side SHM handshake.
  *
- * Flow:
- * 1. Generate unique names for our write data region + GQM write queue
- * 2. Send our handshake info (region names + sizes) to server
- * 3. Receive server's handshake info
- * 4. Create our write data region + GQM write queue
- * 5. Open server's write data region as our read region
- * 6. Open server's GQM write queue as our GQM read queue
- * 7. Close the handshake socket
- *
- * @param evb EventBase for async operations
- * @param sock Connected socket for handshake (Unix domain socket preferred)
- * @param config Transport configuration
- * @return ShmHandshakeResult with regions and GQM queues
+ * Uses config.memoryProvider (falls back to PosixShmProvider) to
+ * create/import data regions.
  */
 ShmHandshakeResult shmHandshakeClient(
     EventBase* evb,
@@ -74,12 +60,7 @@ ShmHandshakeResult shmHandshakeClient(
     const BusyPollSharedMemoryTransport::Config& config = {});
 
 /**
- * Perform shared memory handshake on the server side.
- *
- * @param evb EventBase for async operations
- * @param sock Connected socket for handshake
- * @param config Transport configuration
- * @return ShmHandshakeResult with regions and GQM queues
+ * Server-side SHM handshake.
  */
 ShmHandshakeResult shmHandshakeServer(
     EventBase* evb,
