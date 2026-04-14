@@ -50,21 +50,33 @@ graph TB
   C2S --> ReadCtx
 ```
 
-## 3. Memory Layout (per direction, 1 GB)
+## 3. Memory Layout (cross-cursor for NC+CC)
+
+Each memfile is NC-written by exactly one side. writeCursor for this
+direction and readCursor for the OPPOSITE direction both live in the
+same memfile, so every shared-memory write is NC (noncacheable).
 
 ```
-/dev/memfile0 (s2c direction)
+/dev/memfile0 (Server NC writes)
 +--------------------------------------------------------------+
-| [0, 32KB)          GQM region (4KB aligned, depth 496)       |
-| [32KB, 32KB+128)   ControlBlock (shared, cross-process)      |
-|   [+0,  +64)       cacheline 0: writeCursor (atomic uint64)  |
-|   [+64, +128)      cacheline 1: readCursor  (atomic uint64)  |
-| [32KB+128, ~1GB)   Usable ring buffer (pure payload)         |
+| [0, 32KB)          GQM region (s2c, depth 496)               |
+| [32KB, 32KB+64)    s2c writeCursor  (Server NC write)        |
+| [32KB+64, 32KB+128) c2s readCursor  (Server NC write)        |
+| [32KB+128, ~1GB)   s2c ring buffer payload                   |
++--------------------------------------------------------------+
+
+/dev/memfile1 (Client NC writes)
++--------------------------------------------------------------+
+| [0, 32KB)          GQM region (c2s, depth 496)               |
+| [32KB, 32KB+64)    c2s writeCursor  (Client NC write)        |
+| [32KB+64, 32KB+128) s2c readCursor  (Client NC write)        |
+| [32KB+128, ~1GB)   c2s ring buffer payload                   |
 +--------------------------------------------------------------+
 ```
 
 - GQM: 1 per direction, depth 496, all connections shared
-- ControlBlock: 128 bytes (2 cachelines), avoids false sharing
+- Cursors: 128 bytes (2 cachelines) per memfile; cross-linked so
+  readCursor always lives in the reader's own NC-written memfile
 - Data ring: ~1GB - 32KB - 128B, pure payload, no per-chunk headers
 
 ## 4. Key Data Structures
@@ -80,14 +92,19 @@ Bit layout:
 
 File: `folly/folly/io/async/GqmInterface.h`
 
-### ShmControlBlock (shared memory)
+### Per-direction cursor pointers (cross-linked)
 
 ```cpp
-struct ShmControlBlock {
-  alignas(64) std::atomic<uint64_t> writeCursor;  // cacheline 0
-  alignas(64) std::atomic<uint64_t> readCursor;   // cacheline 1
+struct DirectionContext {
+  std::atomic<uint64_t>* writeCursor;  // in this direction's memfile (+0)
+  std::atomic<uint64_t>* readCursor;   // in opposite direction's memfile (+64)
+  // ...
 };
 ```
+
+writeCursor and readCursor may point into different memfiles.
+After `initFromProvider`, readCursor is cross-linked to the opposite
+direction's memfile so that it is always NC-written by the reader side.
 
 File: `folly/folly/io/async/ShmPollerService.h`
 
@@ -198,6 +215,10 @@ readCursor is a single atomic store by the poller after memcpy. No additional GQ
 ### Why readBufferAvailable (not readDataAvailable)
 
 Thrift Rocket's `FrameLengthParserStrategy::isBufferMovable()` returns true. Using `readBufferAvailable(std::move(iobuf))` transfers IOBuf ownership directly to the parser's readBufQueue -- zero-copy. The legacy `getReadBuffer + memcpy + readDataAvailable` path adds an unnecessary second memcpy.
+
+### Why cross-cursor (readCursor in opposite memfile)
+
+In NC+CC mixed mode, the NC side writes to remote CXL memory and the CC side polls local CXL memory. If readCursor lived in the writer's memfile, the reader (CC side) would write it via cacheable stores -- the NC writer's flow-control read would bypass cache and see stale values, causing deadlock. By placing readCursor in the reader's own NC-written memfile (the opposite direction's memfile), every cursor write goes through NC directly to physical memory. The writer CC-reads it from the peer's memfile, which CXL back-invalidation keeps fresh. GQM is unaffected because `gqm_pop`'s consumer-index write is tolerated as long as no reverse `gqm_push` occurs (confirmed by testing).
 
 ## 10. Known Risks
 

@@ -57,13 +57,20 @@ void ShmPollerService::initDirection(
       provider.poolRemaining(poolName),
       4096);
 
-  ctx.ctrl = reinterpret_cast<ShmControlBlock*>(dataRegion->data());
+  auto* base = static_cast<char*>(dataRegion->data());
+  ctx.writeCursor =
+      reinterpret_cast<std::atomic<uint64_t>*>(base);
+  // readCursor is cross-linked in initFromProvider after both directions init.
+  ctx.readCursor = nullptr;
+
   if (createGqm) {
-    ctx.ctrl->writeCursor.store(0, std::memory_order_relaxed);
-    ctx.ctrl->readCursor.store(0, std::memory_order_relaxed);
+    ctx.writeCursor->store(0, std::memory_order_relaxed);
+    // Also zero the +64 slot (will be used as cross-direction readCursor).
+    auto* crossSlot =
+        reinterpret_cast<std::atomic<uint64_t>*>(base + kCursorSlotSize);
+    crossSlot->store(0, std::memory_order_relaxed);
   }
-  ctx.ringBase =
-      static_cast<char*>(dataRegion->data()) + kControlBlockSize;
+  ctx.ringBase = base + kControlBlockSize;
   ctx.usableSize = dataRegion->size() - kControlBlockSize;
   ctx.dataRegion = std::move(dataRegion);
 
@@ -79,6 +86,25 @@ void ShmPollerService::initFromProvider(
     bool isGqmCreator) {
   initDirection(writeCtx_, provider, writePool, isGqmCreator);
   initDirection(readCtx_, provider, readPool, !isGqmCreator);
+
+  // Cross-link readCursors so each cursor is NC-written by one side only.
+  //
+  // writeCtx_.readCursor: flow-control feedback for data we write.
+  //   The peer (reader of our data) writes this cursor into *its* memfile.
+  //   The peer's memfile is our readCtx_.dataRegion, at offset +64.
+  writeCtx_.readCursor = reinterpret_cast<std::atomic<uint64_t>*>(
+      static_cast<char*>(readCtx_.dataRegion->data()) + kCursorSlotSize);
+
+  // readCtx_.readCursor: we update this after consuming peer's data.
+  //   We write it into *our* memfile (writeCtx_.dataRegion), at offset +64.
+  readCtx_.readCursor = reinterpret_cast<std::atomic<uint64_t>*>(
+      static_cast<char*>(writeCtx_.dataRegion->data()) + kCursorSlotSize);
+
+  XLOG(INFO) << "ShmPollerService: cross-linked readCursors"
+             << " writeCtx.readCursor@"
+             << static_cast<void*>(writeCtx_.readCursor)
+             << " readCtx.readCursor@"
+             << static_cast<void*>(readCtx_.readCursor);
 }
 
 // ========== Poller threads ==========
@@ -102,7 +128,7 @@ void ShmPollerService::stopPollers() {
 }
 
 void ShmPollerService::pollerLoop(DirectionContext& ctx) {
-  uint64_t localReadCursor = ctx.ctrl->readCursor.load(
+  uint64_t localReadCursor = ctx.readCursor->load(
       std::memory_order_relaxed);
   uint32_t idleSpins = 0;
 
@@ -135,7 +161,7 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
     chunk->append(length);
 
     localReadCursor += length;
-    ctx.ctrl->readCursor.store(localReadCursor, std::memory_order_release);
+    ctx.readCursor->store(localReadCursor, std::memory_order_release);
 
     {
       std::lock_guard<std::mutex> lk(connMu_);
@@ -192,8 +218,8 @@ void ShmPollerService::writeData(
     // Flow control: spin until enough free space
     uint32_t spins = 0;
     for (;;) {
-      uint64_t w = ctx.ctrl->writeCursor.load(std::memory_order_relaxed);
-      uint64_t r = ctx.ctrl->readCursor.load(std::memory_order_acquire);
+      uint64_t w = ctx.writeCursor->load(std::memory_order_relaxed);
+      uint64_t r = ctx.readCursor->load(std::memory_order_acquire);
       if (ctx.usableSize - (w - r) >= chunkLen) {
         break;
       }
@@ -203,7 +229,7 @@ void ShmPollerService::writeData(
       }
     }
 
-    uint64_t cursor = ctx.ctrl->writeCursor.fetch_add(
+    uint64_t cursor = ctx.writeCursor->fetch_add(
         chunkLen, std::memory_order_relaxed);
     uint32_t offset = static_cast<uint32_t>(cursor % ctx.usableSize);
 

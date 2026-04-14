@@ -35,16 +35,22 @@ namespace folly {
 class BusyPollSharedMemoryTransport;
 
 /**
- * Shared control block placed at the start of each data region in shared
- * memory.  Both processes can read/write these atomics.  Each cursor
- * occupies its own cacheline to avoid false sharing between writer IO
- * threads and the reader poller thread.
+ * Per-direction control cursors placed at the start of each data region.
+ *
+ * In NC+CC mixed mode (one side noncacheable, one side cacheable-coherent),
+ * writeCursor and readCursor must live in DIFFERENT memory regions so that
+ * each cursor is only NC-written by one side.  The layout per memfile is:
+ *
+ *   [+0,  +64)   writeCursor — written by this memfile's NC owner
+ *   [+64, +128)  cross-direction readCursor — also written by this NC owner
+ *
+ * The "cross-direction readCursor" at +64 feeds back consumption progress
+ * for the OPPOSITE direction's data ring.  This ensures the readCursor
+ * is always NC-written (into the reader's own memfile) and CC-read by the
+ * writer on the other memfile.
  */
-struct ShmControlBlock {
-  alignas(64) std::atomic<uint64_t> writeCursor{0};
-  alignas(64) std::atomic<uint64_t> readCursor{0};
-};
-static_assert(sizeof(ShmControlBlock) == 128);
+static constexpr size_t kCursorSlotSize = 64; // one cacheline per cursor
+static constexpr size_t kControlBlockSize = 2 * kCursorSlotSize; // 128 bytes
 
 /**
  * ShmPollerService: shared GQM + data ring manager with poller dispatch.
@@ -63,12 +69,17 @@ static_assert(sizeof(ShmControlBlock) == 128);
  */
 class ShmPollerService {
  public:
-  static constexpr size_t kControlBlockSize = sizeof(ShmControlBlock);
-
   struct DirectionContext {
     std::unique_ptr<MemoryRegion> dataRegion;
     std::unique_ptr<GqmInterface> gqm;
-    ShmControlBlock* ctrl{nullptr};
+
+    // In NC+CC mode these may point into different memfiles.
+    // writeCursor lives in this direction's own memfile (+0).
+    // readCursor lives in the opposite direction's memfile (+64),
+    // cross-linked by initFromProvider after both directions init.
+    std::atomic<uint64_t>* writeCursor{nullptr};
+    std::atomic<uint64_t>* readCursor{nullptr};
+
     char* ringBase{nullptr};
     size_t usableSize{0};
     std::thread pollerThread;
