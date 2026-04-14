@@ -29,17 +29,28 @@ namespace folly {
 
 namespace {
 
-// Serialize handshake info to IOBuf
-std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
-  size_t bufSize = 4 + // magic
+constexpr uint32_t kHandshakeVersion = 1;
+constexpr size_t kFrameHeaderSize = 4; // uint32_t length prefix
+
+// Compute the payload size for a handshake message (excluding length prefix).
+size_t handshakePayloadSize(const ShmHandshakeInfo& info) {
+  return 4 + // magic
+      4 + // version
       4 + info.writeShmName.size() + // name len + name
       8 + // dataRegionSize
       4 + info.gqmWriteName.size() + // gqm name len + name
       4; // gqmQueueDepth
-  auto buf = IOBuf::create(bufSize);
+}
+
+// Serialize handshake info to IOBuf with a 4-byte length prefix frame.
+std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
+  size_t payloadSize = handshakePayloadSize(info);
+  auto buf = IOBuf::create(kFrameHeaderSize + payloadSize);
   io::Appender appender(buf.get(), 0);
 
+  appender.writeBE<uint32_t>(static_cast<uint32_t>(payloadSize));
   appender.writeBE<uint32_t>(ShmHandshakeInfo::kMagic);
+  appender.writeBE<uint32_t>(kHandshakeVersion);
   appender.writeBE<uint32_t>(static_cast<uint32_t>(info.writeShmName.size()));
   appender.push(
       reinterpret_cast<const uint8_t*>(info.writeShmName.data()),
@@ -54,13 +65,19 @@ std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
   return buf;
 }
 
-// Deserialize handshake info from IOBuf
+// Deserialize handshake info from IOBuf (length prefix already consumed).
 bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
   io::Cursor cursor(buf);
 
   auto magic = cursor.readBE<uint32_t>();
   if (magic != ShmHandshakeInfo::kMagic) {
-    XLOG(ERR) << "Invalid handshake magic: " << magic;
+    XLOG(ERR) << "Invalid handshake magic: 0x" << std::hex << magic;
+    return false;
+  }
+
+  auto version = cursor.readBE<uint32_t>();
+  if (version != kHandshakeVersion) {
+    XLOG(ERR) << "Unsupported handshake version: " << version;
     return false;
   }
 
@@ -87,10 +104,11 @@ bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
   return true;
 }
 
-// Generate a unique shm name
+// Generate a unique shm name using PID + timestamp to avoid collisions.
 std::string generateShmName(
     const std::string& prefix, bool isServer, uint64_t id) {
-  return folly::sformat("{}{}_{:x}", prefix, isServer ? "s" : "c", id);
+  return folly::sformat(
+      "{}{}_{:x}_{}", prefix, isServer ? "s" : "c", id, ::getpid());
 }
 
 // Synchronous write on a socket (for handshake)
@@ -112,7 +130,7 @@ bool syncWrite(
   sock->writeChain(&cb, std::move(buf));
 
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!cb.done_.load(std::memory_order_relaxed)) {
+  while (!cb.done_.load(std::memory_order_relaxed) && cb.error_.empty()) {
     if (std::chrono::steady_clock::now() > deadline) {
       XLOG(ERR) << "Handshake write timeout";
       return false;
@@ -184,6 +202,41 @@ bool syncRead(
   return queue.chainLength() >= minBytes;
 }
 
+// Read a length-prefixed framed handshake message and deserialize it.
+bool readFramedHandshake(
+    EventBase* evb,
+    AsyncTransport* sock,
+    ShmHandshakeInfo& info) {
+  IOBufQueue readQueue;
+
+  // Read the 4-byte length prefix
+  if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
+    XLOG(ERR) << "Failed to read handshake frame header";
+    return false;
+  }
+
+  io::Cursor headerCursor(readQueue.front());
+  uint32_t payloadLen = headerCursor.readBE<uint32_t>();
+  if (payloadLen > 4096) {
+    XLOG(ERR) << "Handshake payload too large: " << payloadLen;
+    return false;
+  }
+
+  // Read the full payload
+  size_t totalNeeded = kFrameHeaderSize + payloadLen;
+  if (readQueue.chainLength() < totalNeeded) {
+    if (!syncRead(evb, sock, readQueue, totalNeeded)) {
+      XLOG(ERR) << "Failed to read full handshake payload";
+      return false;
+    }
+  }
+
+  // Skip past the 4-byte length prefix for deserialization
+  readQueue.trimStart(kFrameHeaderSize);
+  auto payloadBuf = readQueue.move();
+  return deserializeHandshakeInfo(payloadBuf.get(), info);
+}
+
 } // namespace
 
 // ========== Client Handshake ==========
@@ -210,15 +263,10 @@ ShmHandshakeResult shmHandshakeClient(
     throw std::runtime_error("Client handshake: failed to send info");
   }
 
-  // Step 3: Receive peer's handshake info
-  IOBufQueue readQueue;
-  if (!syncRead(evb, sock, readQueue, 4)) { // at least magic
-    throw std::runtime_error("Client handshake: failed to read peer info");
-  }
-  auto readBuf = readQueue.move();
+  // Step 3: Receive peer's handshake info (length-prefixed frame)
   ShmHandshakeInfo peerInfo;
-  if (!deserializeHandshakeInfo(readBuf.get(), peerInfo)) {
-    throw std::runtime_error("Client handshake: invalid peer info");
+  if (!readFramedHandshake(evb, sock, peerInfo)) {
+    throw std::runtime_error("Client handshake: failed to read peer info");
   }
 
   // Step 4: Create shared memory data regions
@@ -236,7 +284,7 @@ ShmHandshakeResult shmHandshakeClient(
   // Step 6: Close the handshake socket
   sock->close();
 
-  XLOG(DBG) << "Client handshake complete: writeRegion="
+  XLOG(DBG5) << "Client handshake complete: writeRegion="
             << myInfo.writeShmName << ", gqmWrite=" << myInfo.gqmWriteName;
 
   return ShmHandshakeResult{
@@ -255,15 +303,10 @@ ShmHandshakeResult shmHandshakeServer(
   uint64_t uniqueId = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
 
-  // Step 1: Receive client's handshake info
-  IOBufQueue readQueue;
-  if (!syncRead(evb, sock, readQueue, 4)) {
-    throw std::runtime_error("Server handshake: failed to read client info");
-  }
-  auto readBuf = readQueue.move();
+  // Step 1: Receive client's handshake info (length-prefixed frame)
   ShmHandshakeInfo clientInfo;
-  if (!deserializeHandshakeInfo(readBuf.get(), clientInfo)) {
-    throw std::runtime_error("Server handshake: invalid client info");
+  if (!readFramedHandshake(evb, sock, clientInfo)) {
+    throw std::runtime_error("Server handshake: failed to read client info");
   }
 
   // Step 2: Create our handshake info
@@ -296,7 +339,7 @@ ShmHandshakeResult shmHandshakeServer(
   // Step 6: Close the handshake socket
   sock->close();
 
-  XLOG(DBG) << "Server handshake complete: writeRegion="
+  XLOG(DBG5) << "Server handshake complete: writeRegion="
             << myInfo.writeShmName << ", gqmWrite=" << myInfo.gqmWriteName;
 
   return ShmHandshakeResult{

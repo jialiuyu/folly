@@ -49,12 +49,8 @@ struct GqmNotification {
  * This is an abstract interface that should be implemented by the actual
  * hardware queue mechanism.
  *
- * The default implementation uses the external C functions:
- *   - gqm_init(void* mem, size_t size) — initialize a memory region as a GQM queue
- *   - gqm_push(void* msg, size_t len)  — push a message (atomic)
- *   - gqm_pop()                        — pop a message (atomic, returns nullptr if empty)
- *
- * These functions should be provided by your hardware queue library.
+ * See DefaultGqmInterface for the reference implementation using external
+ * C functions, or SharedMemoryGqm for a POSIX shm-backed implementation.
  */
 class GqmInterface {
  public:
@@ -73,31 +69,33 @@ class GqmInterface {
   virtual folly::Optional<GqmNotification> pop() = 0;
 
   /**
-   * Check if the queue is empty.
-   * Default implementation tries a pop and discards the result.
-   * Subclasses should override for better performance.
+   * Check if the queue is empty without consuming any notifications.
    */
-  virtual bool empty() {
-    auto result = pop();
-    return !result.hasValue();
-  }
+  virtual bool empty() = 0;
 };
 
 /**
  * Default GQM implementation using the provided C functions.
  *
  * IMPORTANT: The following C functions must be linked:
- *   int  gqm_init(void* mem, size_t size);
- *   void gqm_push(void* msg, size_t len);
- *   void* gqm_pop();
+ *   int  gqm_init(void* queue, size_t size);
+ *   void gqm_push(void* queue, void* msg, size_t len);
+ *   void* gqm_pop(void* queue);
  *
  * - gqm_init: Initialize a memory region as a GQM queue. Returns 0 on success.
- * - gqm_push: Atomically push a message. Thread-safe.
- * - gqm_pop: Atomically pop a message. Returns pointer to 64-bit message,
- *   or nullptr if empty. The message is consumed (read-once).
+ * - gqm_push: Atomically push a message to the specified queue. Thread-safe.
+ * - gqm_pop: Atomically pop a message from the specified queue. Returns pointer
+ *   to 64-bit message, or nullptr if empty. The message is consumed (read-once).
+ *
+ * All functions require a queue pointer obtained from gqm_init.
  */
 class DefaultGqmInterface : public GqmInterface {
  public:
+  /**
+   * Construct with a pointer to an already-initialized GQM queue region.
+   */
+  explicit DefaultGqmInterface(void* queueMem) : queueMem_(queueMem) {}
+
   /**
    * Initialize a memory region as a GQM queue.
    * @param mem Pointer to the shared memory region
@@ -108,6 +106,10 @@ class DefaultGqmInterface : public GqmInterface {
 
   void push(const GqmNotification& notification) override;
   folly::Optional<GqmNotification> pop() override;
+  bool empty() override;
+
+ private:
+  void* queueMem_;
 };
 
 /**
@@ -163,6 +165,7 @@ class SharedMemoryGqm : public GqmInterface {
 
   void push(const GqmNotification& notification) override;
   folly::Optional<GqmNotification> pop() override;
+  bool empty() override;
 
   /**
    * Get the shared memory region name.
@@ -179,12 +182,14 @@ class SharedMemoryGqm : public GqmInterface {
       const std::string& name,
       int fd,
       void* mappedAddr,
-      size_t totalSize);
+      size_t totalSize,
+      bool isCreator);
 
   std::string name_;
   int fd_;
   void* mappedAddr_;
   size_t totalSize_;
+  bool isCreator_;
 };
 
 /**

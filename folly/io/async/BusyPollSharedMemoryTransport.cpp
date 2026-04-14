@@ -39,14 +39,16 @@ namespace folly {
 
 // ========== Platform-specific eventfd helpers (for ADAPTIVE mode wakeup) ==========
 
-int BusyPollSharedMemoryTransport::createEventFd() {
+void BusyPollSharedMemoryTransport::createWakeupFds(
+    int& readFd, int& writeFd) {
 #ifdef __linux__
   int fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (fd < 0) {
     throw std::runtime_error(
         folly::sformat("Failed to create eventfd: {}", strerror(errno)));
   }
-  return fd;
+  readFd = fd;
+  writeFd = fd;
 #else
   int pipefd[2];
   if (::pipe(pipefd) < 0) {
@@ -57,14 +59,8 @@ int BusyPollSharedMemoryTransport::createEventFd() {
     int flags = ::fcntl(pipefd[i], F_GETFL);
     ::fcntl(pipefd[i], F_SETFL, flags | O_NONBLOCK);
   }
-  // Store the write end separately — caller must handle this
-  // We'll use a hack: return the read end, and the write end is
-  // stored via a separate mechanism.
-  // For pipe, we return read end. Write end stored by caller.
-  // Since we can't return two fds, we close write end here and
-  // create the pipe differently in the caller.
-  ::close(pipefd[1]);
-  return pipefd[0];
+  readFd = pipefd[0];
+  writeFd = pipefd[1];
 #endif
 }
 
@@ -119,13 +115,13 @@ BusyPollSharedMemoryTransport::BusyPollSharedMemoryTransport(
       gqmRead_(std::move(gqmRead)),
       config_(config) {
   state_ = State::CONNECTED;
-  XLOG(DBG) << "BusyPollSharedMemoryTransport created, mode="
-            << static_cast<int>(config_.pollingMode);
+  XLOG(DBG5) << "BusyPollSharedMemoryTransport created, mode="
+             << static_cast<int>(config_.pollingMode);
 }
 
 BusyPollSharedMemoryTransport::~BusyPollSharedMemoryTransport() {
   closeNow();
-  XLOG(DBG) << "BusyPollSharedMemoryTransport destroyed";
+  XLOG(DBG5) << "BusyPollSharedMemoryTransport destroyed";
 }
 
 // ========== Static Factory Method ==========
@@ -157,28 +153,7 @@ BusyPollSharedMemoryTransport::create(
       transport->startPollerThread();
       break;
     case PollingMode::ADAPTIVE:
-      // Create wakeup fd for adaptive sleep
-#ifdef __linux__
-      transport->wakeupFd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-      if (transport->wakeupFd_ < 0) {
-        throw std::runtime_error(folly::sformat(
-            "Failed to create wakeup eventfd: {}", strerror(errno)));
-      }
-#else
-      {
-        int pipefd[2];
-        if (::pipe(pipefd) < 0) {
-          throw std::runtime_error(folly::sformat(
-              "Failed to create wakeup pipe: {}", strerror(errno)));
-        }
-        for (int i = 0; i < 2; ++i) {
-          int flags = ::fcntl(pipefd[i], F_GETFL);
-          ::fcntl(pipefd[i], F_SETFL, flags | O_NONBLOCK);
-        }
-        transport->wakeupFd_ = pipefd[0];
-        transport->wakeupFdWrite_ = pipefd[1];
-      }
-#endif
+      createWakeupFds(transport->wakeupFd_, transport->wakeupFdWrite_);
       transport->startPollerThread();
       break;
     case PollingMode::DEDICATED_CORE:
@@ -222,8 +197,20 @@ void BusyPollSharedMemoryTransport::writev(
     const iovec* vec,
     size_t count,
     WriteFlags flags) {
-  auto ioBuf = IOBuf::fromIovec(vec, count);
-  writeChain(callback, std::move(ioBuf), flags);
+  std::unique_ptr<IOBuf> head;
+  for (size_t i = 0; i < count; ++i) {
+    auto buf = IOBuf::copyBuffer(vec[i].iov_base, vec[i].iov_len);
+    if (head) {
+      head->prependChain(std::move(buf));
+    } else {
+      head = std::move(buf);
+    }
+  }
+  if (head) {
+    writeChain(callback, std::move(head), flags);
+  } else if (callback) {
+    callback->writeSuccess();
+  }
 }
 
 void BusyPollSharedMemoryTransport::writeChain(
@@ -257,7 +244,6 @@ void BusyPollSharedMemoryTransport::writeInternal(
     return;
   }
 
-  size_t totalBytes = buf->computeChainDataLength();
   size_t bytesWritten = 0;
 
   for (auto& iov : *buf) {
@@ -275,7 +261,7 @@ void BusyPollSharedMemoryTransport::writeInternal(
     bytesWritten += written;
 
     if (static_cast<size_t>(written) < iov.size()) {
-      XLOG(DBG) << "Partial write: " << written << "/" << iov.size();
+      XLOG(DBG3) << "Partial write: " << written << "/" << iov.size();
       if (callback) {
         callback->writeErr(
             bytesWritten,
@@ -299,26 +285,14 @@ void BusyPollSharedMemoryTransport::writeInternal(
 
 void BusyPollSharedMemoryTransport::signalPeer() {
   if (gqmWrite_) {
-    uint64_t writeOffset =
+    uint64_t writeOff =
         writeRegion_->header()->writeOffset.load(std::memory_order_acquire);
-    uint32_t offsetInRegion =
-        static_cast<uint32_t>(writeOffset % writeRegion_->dataSize());
-    GqmNotification notification{
-        offsetInRegion >= bytesWritten_.load(std::memory_order_relaxed)
-            ? offsetInRegion - bytesWritten_.load(std::memory_order_relaxed)
-            : 0,
-        static_cast<uint32_t>(bytesWritten_.load(std::memory_order_relaxed))};
-    // Simplified: just notify that new data is available
-    gqmWrite_->push({0, 0});
+    uint32_t offset =
+        static_cast<uint32_t>(writeOff % writeRegion_->dataSize());
+    uint32_t len =
+        static_cast<uint32_t>(writeCount_.load(std::memory_order_relaxed));
+    gqmWrite_->push({offset, len});
     gqmPushCount_++;
-
-    // In ADAPTIVE mode: also wake up the peer's poller if it might be sleeping
-    // This is done via eventfd, which is only needed when the poller
-    // is in sleep mode. The poller checks GQM first after waking.
-    // Note: The peer's wakeup fd is not directly accessible here.
-    // The peer's poller thread will detect the GQM notification
-    // on its next spin iteration. If the peer is sleeping,
-    // it will wake up within sleepTimeoutUs.
   }
 }
 
@@ -347,13 +321,14 @@ void BusyPollSharedMemoryTransport::closeNow() {
   // Unregister EventBase polling
   unregisterEventBasePoll();
 
-  // Close wakeup fd (ADAPTIVE mode)
+  // Close wakeup fds (ADAPTIVE mode)
+  // On Linux, wakeupFd_ == wakeupFdWrite_ (same eventfd), avoid double-close.
+  if (wakeupFdWrite_ >= 0 && wakeupFdWrite_ != wakeupFd_) {
+    ::close(wakeupFdWrite_);
+  }
+  wakeupFdWrite_ = -1;
   closeEventFd(wakeupFd_);
   wakeupFd_ = -1;
-  if (wakeupFdWrite_ >= 0) {
-    ::close(wakeupFdWrite_);
-    wakeupFdWrite_ = -1;
-  }
 
   // Close shared memory regions
   if (writeRegion_) {
@@ -388,7 +363,7 @@ void BusyPollSharedMemoryTransport::closeNow() {
     closeCallback_();
   }
 
-  XLOG(DBG) << "BusyPollSharedMemoryTransport closed";
+  XLOG(DBG5) << "BusyPollSharedMemoryTransport closed";
 }
 
 void BusyPollSharedMemoryTransport::closeWithReset() {
@@ -475,20 +450,28 @@ void BusyPollSharedMemoryTransport::checkForAvailableData() {
 // ========== Core: poll GQM and deliver data ==========
 
 bool BusyPollSharedMemoryTransport::pollAndDeliver() {
-  bool delivered = false;
+  bool hasNotification = false;
 
-  // Drain all GQM notifications
   while (auto notif = gqmRead_->pop()) {
     gqmPopCount_++;
-    delivered = true;
+    hasNotification = true;
   }
 
-  // Deliver available data regardless of notification count
-  if (delivered || readRegion_->availableToRead() > 0) {
-    deliverReadData();
+  if (hasNotification || readRegion_->availableToRead() > 0) {
+    // Always deliver data on the EventBase thread for thread safety
+    if (evb_ && evb_->isInEventBaseThread()) {
+      deliverReadData();
+    } else if (evb_) {
+      evb_->runInEventBaseThread([this]() {
+        if (state_ == State::CONNECTED && readCallback_) {
+          deliverReadData();
+        }
+      });
+    }
+    return true;
   }
 
-  return delivered;
+  return false;
 }
 
 void BusyPollSharedMemoryTransport::deliverReadData() {
@@ -554,13 +537,7 @@ void BusyPollSharedMemoryTransport::stopPollerThread() {
   pollerRunning_.store(false, std::memory_order_release);
   // Wake up poller if sleeping (ADAPTIVE mode)
   if (wakeupFdWrite_ >= 0) {
-    uint8_t c = 1;
-    ::write(wakeupFdWrite_, &c, sizeof(c));
-  } else if (wakeupFd_ >= 0) {
-#ifdef __linux__
-    uint64_t val = 1;
-    ::write(wakeupFd_, &val, sizeof(val));
-#endif
+    writeEventFd(wakeupFdWrite_);
   }
   if (pollerThread_.joinable()) {
     pollerThread_.join();
@@ -570,29 +547,25 @@ void BusyPollSharedMemoryTransport::stopPollerThread() {
 // ========== Strategy A: Pure Busy-Poll ==========
 
 void BusyPollSharedMemoryTransport::pollerLoopBusyPoll() {
-  XLOG(DBG) << "Busy-poll thread started (pure spin)";
+  XLOG(DBG5) << "Busy-poll thread started (pure spin)";
   while (pollerRunning_.load(std::memory_order_relaxed)) {
     pollCycles_++;
-    if (pollAndDeliver()) {
-      // Data was found — schedule delivery on EventBase
-      evb_->runInEventBaseThread([this]() {
-        // Data already delivered by pollAndDeliver,
-        // but we need to ensure read callback is invoked on EventBase thread
-      });
-    }
+    pollAndDeliver();
 #if defined(__x86_64__)
     __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
 #endif
   }
-  XLOG(DBG) << "Busy-poll thread stopped";
+  XLOG(DBG5) << "Busy-poll thread stopped";
 }
 
 // ========== Strategy B: NAPI-style Adaptive Hybrid ==========
 
 void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
-  XLOG(DBG) << "Adaptive poller thread started (spin="
-            << config_.spinLimit << ", highLoad=" << config_.highLoadThreshold
-            << ", sleep=" << config_.sleepTimeoutUs << "us)";
+  XLOG(DBG5) << "Adaptive poller thread started (spin="
+             << config_.spinLimit << ", highLoad=" << config_.highLoadThreshold
+             << ", sleep=" << config_.sleepTimeoutUs << "us)";
 
   uint32_t consecutiveHits = 0;
   uint32_t spinCount = 0;
@@ -605,79 +578,54 @@ void BusyPollSharedMemoryTransport::pollerLoopAdaptive() {
     if (found) {
       consecutiveHits++;
       spinCount = 0;
-
-      // Schedule any needed callbacks on EventBase
-      if (readCallback_) {
-        evb_->runInEventBaseThread([this]() {
-          // Ensure read callback processing happens on EventBase
-          deliverReadData();
-        });
-      }
     } else {
       consecutiveHits = 0;
       spinCount++;
     }
 
     if (consecutiveHits >= config_.highLoadThreshold) {
-      // High load mode: keep spinning (NAPI poll mode)
 #if defined(__x86_64__)
       __builtin_ia32_pause();
+#elif defined(__aarch64__)
+      asm volatile("yield");
 #endif
     } else if (spinCount > config_.spinLimit) {
-      // Low load mode: sleep and wait for wakeup
       pollerSleeping_.store(true, std::memory_order_release);
       sleepCount_++;
 
-      // Signal peer that we might sleep, so it should wake us
-      // (In ADAPTIVE mode, the wakeupFd is the mechanism)
-      // Sleep using eventfd read with timeout or poll
-#ifdef __linux__
       if (wakeupFd_ >= 0) {
         struct pollfd pfd;
         pfd.fd = wakeupFd_;
         pfd.events = POLLIN;
-        ::poll(&pfd, 1, static_cast<int>(config_.sleepTimeoutUs / 1000));
+        int timeoutMs = std::max(
+            1, static_cast<int>(config_.sleepTimeoutUs / 1000));
+        ::poll(&pfd, 1, timeoutMs);
         drainEventFd(wakeupFd_);
       } else {
         std::this_thread::sleep_for(
             std::chrono::microseconds(config_.sleepTimeoutUs));
       }
-#else
-      if (wakeupFd_ >= 0) {
-        struct pollfd pfd;
-        pfd.fd = wakeupFd_;
-        pfd.events = POLLIN;
-        ::poll(&pfd, 1, static_cast<int>(config_.sleepTimeoutUs / 1000));
-        // Drain pipe
-        uint8_t buf[64];
-        while (::read(wakeupFd_, buf, sizeof(buf)) > 0) {
-        }
-      } else {
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(config_.sleepTimeoutUs));
-      }
-#endif
 
       pollerSleeping_.store(false, std::memory_order_release);
       spinCount = 0;
     } else {
-      // Still within spin budget
 #if defined(__x86_64__)
       __builtin_ia32_pause();
+#elif defined(__aarch64__)
+      asm volatile("yield");
 #endif
     }
   }
 
-  XLOG(DBG) << "Adaptive poller thread stopped";
+  XLOG(DBG5) << "Adaptive poller thread stopped";
 }
 
 // ========== Strategy C: Dedicated Core ==========
 
 void BusyPollSharedMemoryTransport::pollerLoopDedicatedCore() {
-  XLOG(DBG) << "Dedicated core poller started, core="
-            << config_.pinnedCore;
+  XLOG(DBG5) << "Dedicated core poller started, core="
+             << config_.pinnedCore;
 
-  // Pin to specific CPU core
 #ifdef __linux__
   if (config_.pinnedCore >= 0) {
     cpu_set_t cpuset;
@@ -694,61 +642,48 @@ void BusyPollSharedMemoryTransport::pollerLoopDedicatedCore() {
   }
 #endif
 
-  // Pure busy-poll on dedicated core
   while (pollerRunning_.load(std::memory_order_relaxed)) {
     pollCycles_++;
-    if (pollAndDeliver()) {
-      if (readCallback_) {
-        evb_->runInEventBaseThread([this]() { deliverReadData(); });
-      }
-    }
+    pollAndDeliver();
 #if defined(__x86_64__)
     __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
 #endif
   }
 
-  XLOG(DBG) << "Dedicated core poller stopped";
+  XLOG(DBG5) << "Dedicated core poller stopped";
 }
 
 // ========== Strategy D: EventBase-Integrated ==========
+
+void BusyPollSharedMemoryTransport::PollLoopCallback::runLoopCallback()
+    noexcept {
+  if (transport_.state_ != State::CONNECTED || !transport_.evbPollRegistered_) {
+    return;
+  }
+  transport_.pollAndDeliver();
+  if (transport_.evbPollRegistered_ &&
+      transport_.state_ == State::CONNECTED &&
+      transport_.evb_) {
+    transport_.evb_->runInLoop(this);
+  }
+}
 
 void BusyPollSharedMemoryTransport::registerEventBasePoll() {
   if (!evb_ || evbPollRegistered_) {
     return;
   }
   evbPollRegistered_ = true;
-
-  // Register a loop callback that checks GQM on every EventBase iteration
-  evb_->runInLoop([this]() {
-    if (state_ != State::CONNECTED) {
-      evbPollRegistered_ = false;
-      return;
-    }
-
-    pollAndDeliver();
-
-    // Re-register for next loop iteration
-    if (evbPollRegistered_ && state_ == State::CONNECTED) {
-      evb_->runInLoop([this]() {
-        if (evbPollRegistered_ && state_ == State::CONNECTED) {
-          pollAndDeliver();
-          if (evbPollRegistered_ && state_ == State::CONNECTED) {
-            evb_->runInLoop(
-                [this]() {
-                  if (evbPollRegistered_) {
-                    registerEventBasePoll();
-                  }
-                },
-                true /* thisIteration */);
-          }
-        }
-      });
-    }
-  });
+  pollLoopCb_ = std::make_unique<PollLoopCallback>(*this);
+  evb_->runInLoop(pollLoopCb_.get());
 }
 
 void BusyPollSharedMemoryTransport::unregisterEventBasePoll() {
   evbPollRegistered_ = false;
+  if (pollLoopCb_) {
+    pollLoopCb_->cancelLoopCallback();
+  }
 }
 
 // ========== Statistics ==========

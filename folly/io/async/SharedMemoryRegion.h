@@ -31,19 +31,14 @@ namespace folly {
  * SharedMemoryRegionHeader defines the structure of the shared memory header.
  *
  * Memory layout:
- * +------------------+
- * | Header (64 bytes)|
- * +------------------+
- * | Data Region      |
- * | (configurable)   |
- * +------------------+
+ * +-------------------------------+
+ * | Header (sizeof this struct)   |
+ * +-------------------------------+
+ * | Data Region (configurable)    |
+ * +-------------------------------+
  *
- * Header layout (64 bytes):
- * - write_offset (8 bytes): Offset where writer will write next
- * - read_offset (8 bytes): Offset where reader has read up to
- * - data_size (8 bytes): Size of the data region
- * - flags (8 bytes): Flags for synchronization
- * - reserved (32 bytes): Reserved for future use
+ * writeOffset and readOffset are on separate cache lines (alignas(64))
+ * to avoid false sharing between writer and reader.
  */
 struct SharedMemoryRegionHeader {
   // Atomic write offset - updated by the writer
@@ -78,8 +73,7 @@ struct SharedMemoryRegionHeader {
  */
 class SharedMemoryRegion {
  public:
-  // Header size is 64 bytes
-  static constexpr size_t kHeaderSize = 64;
+  static constexpr size_t kHeaderSize = sizeof(SharedMemoryRegionHeader);
 
   /**
    * Creates a new shared memory region with the given name and size.
@@ -103,8 +97,9 @@ class SharedMemoryRegion {
   SharedMemoryRegion& operator=(SharedMemoryRegion&&) = delete;
 
   /**
-   * Get pointer to the header (read-only for external use)
+   * Get pointer to the header.
    */
+  SharedMemoryRegionHeader* header() { return header_; }
   const SharedMemoryRegionHeader* header() const { return header_; }
 
   /**
@@ -179,7 +174,8 @@ class SharedMemoryRegion {
       const std::string& name,
       int fd,
       void* mappedAddr,
-      size_t totalSize);
+      size_t totalSize,
+      bool isCreator);
 
   std::string name_;
   int fd_;
@@ -187,6 +183,7 @@ class SharedMemoryRegion {
   size_t totalSize_;
   SharedMemoryRegionHeader* header_;
   void* data_;
+  bool isCreator_;
 };
 
 /**

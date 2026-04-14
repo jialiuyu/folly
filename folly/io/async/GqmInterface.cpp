@@ -31,10 +31,12 @@ namespace folly {
 
 // ========== External GQM C functions ==========
 // These functions should be provided by your hardware queue library.
+// Each function takes a queue pointer to identify which queue to operate on.
 extern "C" {
-int gqm_init(void* mem, size_t size);
-void gqm_push(void* msg, size_t len);
-void* gqm_pop();
+int gqm_init(void* queue, size_t size);
+void gqm_push(void* queue, void* msg, size_t len);
+void* gqm_pop(void* queue);
+int gqm_empty(void* queue);
 }
 
 // ========== DefaultGqmInterface Implementation ==========
@@ -45,11 +47,11 @@ bool DefaultGqmInterface::init(void* mem, size_t size) {
 
 void DefaultGqmInterface::push(const GqmNotification& notification) {
   uint64_t msg = notification.toUint64();
-  gqm_push(&msg, sizeof(msg));
+  gqm_push(queueMem_, &msg, sizeof(msg));
 }
 
 folly::Optional<GqmNotification> DefaultGqmInterface::pop() {
-  void* result = gqm_pop();
+  void* result = gqm_pop(queueMem_);
   if (result == nullptr) {
     return folly::none;
   }
@@ -59,18 +61,24 @@ folly::Optional<GqmNotification> DefaultGqmInterface::pop() {
   return GqmNotification::fromUint64(msg);
 }
 
+bool DefaultGqmInterface::empty() {
+  return gqm_empty(queueMem_) != 0;
+}
+
 // ========== SharedMemoryGqm Implementation ==========
 
 SharedMemoryGqm::SharedMemoryGqm(
     const std::string& name,
     int fd,
     void* mappedAddr,
-    size_t totalSize)
+    size_t totalSize,
+    bool isCreator)
     : name_(name),
       fd_(fd),
       mappedAddr_(mappedAddr),
-      totalSize_(totalSize) {
-  XLOG(DBG) << "SharedMemoryGqm created: " << name_;
+      totalSize_(totalSize),
+      isCreator_(isCreator) {
+  XLOG(DBG5) << "SharedMemoryGqm created: " << name_;
 }
 
 SharedMemoryGqm::~SharedMemoryGqm() {
@@ -80,7 +88,10 @@ SharedMemoryGqm::~SharedMemoryGqm() {
   if (fd_ >= 0) {
     ::close(fd_);
   }
-  XLOG(DBG) << "SharedMemoryGqm destroyed: " << name_;
+  if (isCreator_) {
+    ::shm_unlink(name_.c_str());
+  }
+  XLOG(DBG5) << "SharedMemoryGqm destroyed: " << name_;
 }
 
 std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::create(
@@ -132,7 +143,7 @@ std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::create(
   }
 
   return std::unique_ptr<SharedMemoryGqm>(
-      new SharedMemoryGqm(name, fd, mappedAddr, totalSize));
+      new SharedMemoryGqm(name, fd, mappedAddr, totalSize, true));
 }
 
 std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::open(
@@ -178,16 +189,16 @@ std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::open(
   }
 
   return std::unique_ptr<SharedMemoryGqm>(
-      new SharedMemoryGqm(name, fd, mappedAddr, totalSize));
+      new SharedMemoryGqm(name, fd, mappedAddr, totalSize, false));
 }
 
 void SharedMemoryGqm::push(const GqmNotification& notification) {
   uint64_t msg = notification.toUint64();
-  gqm_push(&msg, sizeof(msg));
+  gqm_push(mappedAddr_, &msg, sizeof(msg));
 }
 
 folly::Optional<GqmNotification> SharedMemoryGqm::pop() {
-  void* result = gqm_pop();
+  void* result = gqm_pop(mappedAddr_);
   if (result == nullptr) {
     return folly::none;
   }
@@ -195,6 +206,10 @@ folly::Optional<GqmNotification> SharedMemoryGqm::pop() {
   uint64_t msg;
   std::memcpy(&msg, result, sizeof(msg));
   return GqmNotification::fromUint64(msg);
+}
+
+bool SharedMemoryGqm::empty() {
+  return gqm_empty(mappedAddr_) != 0;
 }
 
 } // namespace folly

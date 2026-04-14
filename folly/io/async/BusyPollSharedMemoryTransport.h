@@ -18,9 +18,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include <folly/Function.h>
 #include <folly/Optional.h>
@@ -28,12 +30,11 @@
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocketException.h>
 #include <folly/io/async/AsyncTransport.h>
+#include <folly/io/async/EventBase.h>
 #include <folly/io/async/GqmInterface.h>
 #include <folly/io/async/SharedMemoryRegion.h>
 
 namespace folly {
-
-class EventBase;
 
 /**
  * BusyPollSharedMemoryTransport implements AsyncTransport using shared memory
@@ -246,8 +247,11 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   void registerEventBasePoll();
   void unregisterEventBasePoll();
 
-  // futex-based wakeup for adaptive mode
-  static int createEventFd();
+  // Wakeup fd helpers for adaptive mode
+  // On Linux uses eventfd; on other platforms uses pipe.
+  // createWakeupFds populates readFd and writeFd.
+  // On Linux readFd == writeFd (eventfd is bidirectional).
+  static void createWakeupFds(int& readFd, int& writeFd);
   static void closeEventFd(int fd);
   static bool writeEventFd(int fd);
   static bool drainEventFd(int fd);
@@ -285,7 +289,7 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
     size_t totalBytes{0};
   };
   std::deque<WriteRequest> pendingWrites_;
-  std::mutex writeMutex_;
+  mutable std::mutex writeMutex_;
 
   // Read state
   IOBufQueue readBufQueue_;
@@ -296,11 +300,20 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
 
   // Adaptive mode: eventfd for waking poller from sleep
   // (only used in ADAPTIVE mode, -1 in other modes)
-  int wakeupFd_{-1}; // eventfd or pipe read end
-  int wakeupFdWrite_{-1}; // pipe write end (macOS only)
+  int wakeupFd_{-1}; // read end (eventfd on Linux, pipe read on others)
+  int wakeupFdWrite_{-1}; // write end (same as wakeupFd_ on Linux, pipe write on others)
   std::atomic<bool> pollerSleeping_{false};
 
   // EventBase-integrated polling (EVENTBASE mode)
+  class PollLoopCallback : public EventBase::LoopCallback {
+   public:
+    explicit PollLoopCallback(BusyPollSharedMemoryTransport& transport)
+        : transport_(transport) {}
+    void runLoopCallback() noexcept override;
+   private:
+    BusyPollSharedMemoryTransport& transport_;
+  };
+  std::unique_ptr<PollLoopCallback> pollLoopCb_;
   bool evbPollRegistered_{false};
 
   // Statistics

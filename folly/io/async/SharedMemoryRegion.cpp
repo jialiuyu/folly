@@ -103,22 +103,25 @@ std::unique_ptr<SharedMemoryRegion> SharedMemoryRegion::create(
   }
 
   return std::unique_ptr<SharedMemoryRegion>(
-      new SharedMemoryRegion(name, fd, mappedAddr, totalSize));
+      new SharedMemoryRegion(name, fd, mappedAddr, totalSize, create));
 }
 
 SharedMemoryRegion::SharedMemoryRegion(
     const std::string& name,
     int fd,
     void* mappedAddr,
-    size_t totalSize)
+    size_t totalSize,
+    bool isCreator)
     : name_(name),
       fd_(fd),
       mappedAddr_(mappedAddr),
       totalSize_(totalSize),
       header_(reinterpret_cast<SharedMemoryRegionHeader*>(mappedAddr)),
-      data_(reinterpret_cast<char*>(mappedAddr) + kHeaderSize) {
-  XLOG(DBG) << "SharedMemoryRegion created: " << name_
-            << ", dataSize=" << header_->dataSize;
+      data_(reinterpret_cast<char*>(mappedAddr) + kHeaderSize),
+      isCreator_(isCreator) {
+  XLOG(DBG5) << "SharedMemoryRegion created: " << name_
+             << ", dataSize=" << header_->dataSize
+             << ", isCreator=" << isCreator_;
 }
 
 SharedMemoryRegion::~SharedMemoryRegion() {
@@ -128,12 +131,10 @@ SharedMemoryRegion::~SharedMemoryRegion() {
   if (fd_ >= 0) {
     ::close(fd_);
   }
-  // Unlink the shared memory (only the creator should do this, but we don't
-  // track who created it. This is safe since unlink just removes the name;
-  // the memory remains until all processes unmap it.)
-  // Note: We don't call shm_unlink here because we don't know if we're the
-  // last user. The caller is responsible for cleanup if needed.
-  XLOG(DBG) << "SharedMemoryRegion destroyed: " << name_;
+  if (isCreator_) {
+    ::shm_unlink(name_.c_str());
+  }
+  XLOG(DBG5) << "SharedMemoryRegion destroyed: " << name_;
 }
 
 size_t SharedMemoryRegion::availableToRead() const {
@@ -234,23 +235,6 @@ void SharedMemoryRegion::setReaderEventFd(int fd) {
 
 int SharedMemoryRegion::getReaderEventFd() const {
   return header_->readerEventFd.load(std::memory_order_acquire);
-}
-
-// ========== DefaultGqmInterface Implementation ==========
-
-void DefaultGqmInterface::push(const GqmNotification& notification) {
-  uint64_t msg = notification.toUint64();
-  gqm_push(&msg, sizeof(msg));
-}
-
-folly::Optional<GqmNotification> DefaultGqmInterface::pop() {
-  void* result = gqm_pop();
-  if (result == nullptr) {
-    return folly::none;
-  }
-
-  uint64_t msg = *reinterpret_cast<uint64_t*>(result);
-  return GqmNotification::fromUint64(msg);
 }
 
 } // namespace folly
