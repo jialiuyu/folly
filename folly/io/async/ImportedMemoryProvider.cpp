@@ -16,6 +16,7 @@
 
 #include <folly/io/async/ImportedMemoryProvider.h>
 
+#include <cstring>
 #include <stdexcept>
 
 #include <folly/Format.h>
@@ -28,46 +29,173 @@ void ImportedMemoryProvider::registerPool(
   std::lock_guard<std::mutex> lock(mu_);
   pools_[poolName] = Pool{addr, size, 0};
   XLOG(DBG5) << "ImportedMemoryProvider: registered pool '" << poolName
-             << "', size=" << size;
+             << "', base=" << addr << ", size=" << size;
 }
 
-void* ImportedMemoryProvider::allocateFromPool(size_t size) {
-  for (auto& [poolName, pool] : pools_) {
-    if (pool.allocated + size <= pool.totalSize) {
-      void* ptr =
-          static_cast<char*>(pool.baseAddr) + pool.allocated;
-      pool.allocated += size;
-      XLOG(DBG5) << "ImportedMemoryProvider: allocated " << size
-                 << " bytes from pool '" << poolName
-                 << "', remaining=" << (pool.totalSize - pool.allocated);
-      return ptr;
-    }
-  }
-  return nullptr;
-}
+// ---- Legacy MemoryProvider interface (first-fit, no pool selection) ----
 
 std::unique_ptr<MemoryRegion> ImportedMemoryProvider::create(
     const std::string& name, size_t size) {
   std::lock_guard<std::mutex> lock(mu_);
-  void* addr = allocateFromPool(size);
-  if (!addr) {
-    throw std::runtime_error(folly::sformat(
-        "ImportedMemoryProvider::create: no pool has {} bytes available", size));
+  for (auto& [poolName, pool] : pools_) {
+    if (pool.allocated + size <= pool.totalSize) {
+      size_t off = pool.allocated;
+      void* ptr = static_cast<char*>(pool.baseAddr) + off;
+      pool.allocated += size;
+      std::memset(ptr, 0, size);
+      XLOG(DBG5) << "create '" << name << "' from pool '" << poolName
+                 << "', offset=" << off << ", size=" << size;
+      return std::make_unique<ImportedMemoryRegion>(name, ptr, size, off);
+    }
   }
-  std::memset(addr, 0, size);
-  return std::make_unique<ImportedMemoryRegion>(name, addr, size);
+  throw std::runtime_error(folly::sformat(
+      "ImportedMemoryProvider::create: no pool has {} bytes available", size));
 }
 
 std::unique_ptr<MemoryRegion> ImportedMemoryProvider::import(
     const std::string& name, size_t size) {
   std::lock_guard<std::mutex> lock(mu_);
-  void* addr = allocateFromPool(size);
-  if (!addr) {
-    throw std::runtime_error(folly::sformat(
-        "ImportedMemoryProvider::import: no pool has {} bytes available",
-        size));
+  for (auto& [poolName, pool] : pools_) {
+    if (pool.allocated + size <= pool.totalSize) {
+      size_t off = pool.allocated;
+      void* ptr = static_cast<char*>(pool.baseAddr) + off;
+      pool.allocated += size;
+      XLOG(DBG5) << "import '" << name << "' from pool '" << poolName
+                 << "', offset=" << off << ", size=" << size;
+      return std::make_unique<ImportedMemoryRegion>(name, ptr, size, off);
+    }
   }
-  return std::make_unique<ImportedMemoryRegion>(name, addr, size);
+  throw std::runtime_error(folly::sformat(
+      "ImportedMemoryProvider::import: no pool has {} bytes available", size));
+}
+
+std::unique_ptr<MemoryRegion> ImportedMemoryProvider::createAligned(
+    const std::string& name, size_t size, size_t alignment) {
+  return createFromPool("", name, size, alignment);
+}
+
+std::unique_ptr<MemoryRegion> ImportedMemoryProvider::importAtOffset(
+    const std::string& poolName,
+    const std::string& regionName,
+    size_t offset,
+    size_t size) {
+  return importFromPool(poolName, regionName, offset, size);
+}
+
+// ---- Pool-aware allocation (CXL path) ----
+
+std::unique_ptr<MemoryRegion> ImportedMemoryProvider::createFromPool(
+    const std::string& poolName,
+    const std::string& regionName,
+    size_t size,
+    size_t alignment) {
+  std::lock_guard<std::mutex> lock(mu_);
+
+  auto allocate = [&](Pool& pool, const std::string& pName)
+      -> std::unique_ptr<MemoryRegion> {
+    size_t alignedOff = (pool.allocated + alignment - 1) & ~(alignment - 1);
+    if (alignedOff + size > pool.totalSize) {
+      return nullptr;
+    }
+    void* ptr = static_cast<char*>(pool.baseAddr) + alignedOff;
+    pool.allocated = alignedOff + size;
+    std::memset(ptr, 0, size);
+    XLOG(DBG5) << "createFromPool '" << regionName << "' in pool '" << pName
+               << "', offset=" << alignedOff << ", size=" << size
+               << ", align=" << alignment;
+    return std::make_unique<ImportedMemoryRegion>(
+        regionName, ptr, size, alignedOff);
+  };
+
+  if (!poolName.empty()) {
+    auto it = pools_.find(poolName);
+    if (it == pools_.end()) {
+      throw std::runtime_error(folly::sformat(
+          "ImportedMemoryProvider::createFromPool: pool '{}' not found",
+          poolName));
+    }
+    auto region = allocate(it->second, poolName);
+    if (!region) {
+      throw std::runtime_error(folly::sformat(
+          "ImportedMemoryProvider::createFromPool: pool '{}' has insufficient "
+          "space for {} bytes (aligned {})",
+          poolName, size, alignment));
+    }
+    return region;
+  }
+
+  // No pool specified — first fit
+  for (auto& [pName, pool] : pools_) {
+    auto region = allocate(pool, pName);
+    if (region) {
+      return region;
+    }
+  }
+  throw std::runtime_error(folly::sformat(
+      "ImportedMemoryProvider::createFromPool: no pool has {} bytes available "
+      "(aligned {})",
+      size, alignment));
+}
+
+std::unique_ptr<MemoryRegion> ImportedMemoryProvider::importFromPool(
+    const std::string& poolName,
+    const std::string& regionName,
+    size_t offset,
+    size_t size) {
+  std::lock_guard<std::mutex> lock(mu_);
+
+  auto resolveFromPool = [&](Pool& pool) -> std::unique_ptr<MemoryRegion> {
+    if (offset + size > pool.totalSize) {
+      return nullptr;
+    }
+    void* ptr = static_cast<char*>(pool.baseAddr) + offset;
+    return std::make_unique<ImportedMemoryRegion>(
+        regionName, ptr, size, offset);
+  };
+
+  if (!poolName.empty()) {
+    auto it = pools_.find(poolName);
+    if (it == pools_.end()) {
+      throw std::runtime_error(folly::sformat(
+          "ImportedMemoryProvider::importFromPool: pool '{}' not found",
+          poolName));
+    }
+    auto region = resolveFromPool(it->second);
+    if (!region) {
+      throw std::runtime_error(folly::sformat(
+          "ImportedMemoryProvider::importFromPool: offset {} + size {} exceeds "
+          "pool '{}' total size {}",
+          offset, size, poolName, it->second.totalSize));
+    }
+    XLOG(DBG5) << "importFromPool '" << regionName << "' in pool '" << poolName
+               << "', offset=" << offset << ", size=" << size;
+    return region;
+  }
+
+  // No pool specified — try all pools
+  for (auto& [pName, pool] : pools_) {
+    auto region = resolveFromPool(pool);
+    if (region) {
+      XLOG(DBG5) << "importFromPool '" << regionName << "' in pool '" << pName
+                 << "', offset=" << offset << ", size=" << size;
+      return region;
+    }
+  }
+  throw std::runtime_error(folly::sformat(
+      "ImportedMemoryProvider::importFromPool: no pool can resolve offset={}, "
+      "size={}",
+      offset, size));
+}
+
+size_t ImportedMemoryProvider::poolRemaining(const std::string& poolName) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = pools_.find(poolName);
+  if (it == pools_.end()) {
+    throw std::runtime_error(folly::sformat(
+        "ImportedMemoryProvider::poolRemaining: pool '{}' not found",
+        poolName));
+  }
+  return it->second.totalSize - it->second.allocated;
 }
 
 } // namespace folly

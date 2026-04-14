@@ -31,28 +31,34 @@ namespace folly {
  */
 class ImportedMemoryRegion : public MemoryRegion {
  public:
-  ImportedMemoryRegion(const std::string& name, void* addr, size_t size)
-      : name_(name), addr_(addr), size_(size) {}
+  ImportedMemoryRegion(
+      const std::string& name, void* addr, size_t size, size_t offset)
+      : name_(name), addr_(addr), size_(size), offset_(offset) {}
 
   void* data() override { return addr_; }
   const void* data() const override { return addr_; }
   size_t size() const override { return size_; }
   const std::string& name() const override { return name_; }
+  size_t offset() const override { return offset_; }
 
  private:
   std::string name_;
   void* addr_;
   size_t size_;
+  size_t offset_;
 };
 
 /**
  * MemoryProvider that hands out sub-regions from pre-registered memory pools.
+ * Designed for CXL device files or pre-allocated hugepage regions.
  *
- * Typical usage:
- *   1. At process startup, mmap a 1 GB hugepage region.
- *   2. Call registerPool("pool0", addr, 1GB).
- *   3. Pass this provider to BusyPollSharedMemoryTransport::Config.
- *   4. create()/import() carve sub-regions from the pool via bump allocation.
+ * Typical usage (benchmark):
+ *   1. At process start, mmap two 1 GB CXL device files.
+ *   2. registerPool("s2c", addr0, 1GB) — server→client direction.
+ *      registerPool("c2s", addr1, 1GB) — client→server direction.
+ *   3. Pass this provider + pool names to BusyPollSharedMemoryTransport::Config.
+ *   4. The handshake allocates data regions and GQM regions from the
+ *      appropriate pools via createFromPool / importFromPool.
  *
  * Thread-safe: multiple connections can allocate concurrently.
  */
@@ -64,30 +70,61 @@ class ImportedMemoryProvider : public MemoryProvider {
     size_t allocated{0};
   };
 
-  /**
-   * Register a pre-allocated memory pool.
-   * @param poolName  Logical name for the pool.
-   * @param addr      Start address (caller owns the memory).
-   * @param size      Total size in bytes.
-   */
   void registerPool(const std::string& poolName, void* addr, size_t size);
 
-  /**
-   * Allocate a sub-region from the first pool that has enough space.
-   * The returned MemoryRegion does NOT free the memory on destruction.
-   */
+  // --- MemoryProvider interface ---
+
+  /** Allocate from the first pool with enough space (legacy path). */
   std::unique_ptr<MemoryRegion> create(
       const std::string& name, size_t size) override;
 
-  /**
-   * Import is identical to create for this provider (both carve from pool).
-   */
+  /** Legacy import — bump-allocates (only correct for single-connection). */
   std::unique_ptr<MemoryRegion> import(
       const std::string& name, size_t size) override;
 
- private:
-  void* allocateFromPool(size_t size);
+  std::unique_ptr<MemoryRegion> createAligned(
+      const std::string& name, size_t size, size_t alignment) override;
 
+  /**
+   * Import at a known offset within a specific pool.
+   * No bump allocation — the offset was determined by the creator side
+   * and communicated via handshake.
+   */
+  std::unique_ptr<MemoryRegion> importAtOffset(
+      const std::string& poolName,
+      const std::string& regionName,
+      size_t offset,
+      size_t size) override;
+
+  bool usesSharedBackingStore() const override { return true; }
+
+  // --- Pool-aware allocation (CXL path) ---
+
+  /**
+   * Bump-allocate from a specific named pool with alignment.
+   * The returned region records its offset within the pool.
+   */
+  std::unique_ptr<MemoryRegion> createFromPool(
+      const std::string& poolName,
+      const std::string& regionName,
+      size_t size,
+      size_t alignment = 1);
+
+  /**
+   * Access a specific pool at a known offset (no allocation).
+   */
+  std::unique_ptr<MemoryRegion> importFromPool(
+      const std::string& poolName,
+      const std::string& regionName,
+      size_t offset,
+      size_t size);
+
+  /**
+   * Return remaining unallocated bytes in the named pool.
+   */
+  size_t poolRemaining(const std::string& poolName);
+
+ private:
   std::mutex mu_;
   std::unordered_map<std::string, Pool> pools_;
 };

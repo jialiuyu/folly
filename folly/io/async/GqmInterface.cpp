@@ -212,4 +212,52 @@ bool SharedMemoryGqm::empty() {
   return gqm_empty(mappedAddr_) != 0;
 }
 
+// ========== ImportedGqm Implementation ==========
+
+ImportedGqm::ImportedGqm(
+    std::unique_ptr<MemoryRegion> region, bool isCreator)
+    : region_(std::move(region)), isCreator_(isCreator) {}
+
+std::unique_ptr<ImportedGqm> ImportedGqm::create(
+    std::unique_ptr<MemoryRegion> region) {
+  if (gqm_init(region->data(), region->size()) != 0) {
+    throw std::runtime_error(folly::sformat(
+        "ImportedGqm::create: gqm_init failed for region '{}'",
+        region->name()));
+  }
+  XLOG(DBG5) << "ImportedGqm created: " << region->name()
+             << ", offset=" << region->offset()
+             << ", size=" << region->size();
+  return std::unique_ptr<ImportedGqm>(
+      new ImportedGqm(std::move(region), true));
+}
+
+std::unique_ptr<ImportedGqm> ImportedGqm::open(
+    std::unique_ptr<MemoryRegion> region) {
+  XLOG(DBG5) << "ImportedGqm opened: " << region->name()
+             << ", offset=" << region->offset()
+             << ", size=" << region->size();
+  return std::unique_ptr<ImportedGqm>(
+      new ImportedGqm(std::move(region), false));
+}
+
+void ImportedGqm::push(const GqmNotification& notification) {
+  uint64_t msg = notification.toUint64();
+  gqm_push(region_->data(), &msg, sizeof(msg));
+}
+
+folly::Optional<GqmNotification> ImportedGqm::pop() {
+  void* result = gqm_pop(region_->data());
+  if (result == nullptr) {
+    return folly::none;
+  }
+  uint64_t msg;
+  std::memcpy(&msg, result, sizeof(msg));
+  return GqmNotification::fromUint64(msg);
+}
+
+bool ImportedGqm::empty() {
+  return gqm_empty(region_->data()) != 0;
+}
+
 } // namespace folly

@@ -22,31 +22,40 @@
 #include <string>
 
 #include <folly/Optional.h>
+#include <folly/io/async/MemoryProvider.h>
 
 namespace folly {
 
 /**
- * GQM descriptor: 64 bits encoding (offset:32 | length:32).
+ * GQM descriptor: 64 bits encoding connId:16 | offset:32 | length:16.
  *
- * In the ring-queue model, each GQM entry IS one data chunk descriptor
- * pointing into the flat shared memory data region.  GQM's internal
- * atomic push/pop provides ordering and flow control, so the data region
- * itself needs no writeOffset/readOffset management.
+ * Bit layout:
+ *   [63:48]  connId  — 16 bits, max 65535 connections per poller
+ *   [47:16]  offset  — 32 bits, max 4 GB (covers 1 GB pool)
+ *   [15:0]   length  — 16 bits, max 65535 bytes (~64 KB per chunk)
+ *
+ * In the shared-GQM model a single queue serves all connections.  The
+ * poller extracts connId to dispatch data to the correct transport.
+ * For legacy per-connection mode, connId is set to 0.
  */
 struct GqmNotification {
-  uint32_t offset; // Byte offset into the data region
-  uint32_t length; // Chunk length in bytes
+  uint16_t connId{0}; // Connection identifier (0 for legacy mode)
+  uint32_t offset{0}; // Byte offset into the data region
+  uint16_t length{0}; // Chunk length in bytes
 
-  static constexpr uint32_t kMaxChunkSize = 64 * 1024; // 64 KB
+  static constexpr uint16_t kMaxChunkSize = 65535;
 
   uint64_t toUint64() const {
-    return (static_cast<uint64_t>(offset) << 32) | length;
+    return (static_cast<uint64_t>(connId) << 48) |
+           (static_cast<uint64_t>(offset) << 16) |
+           length;
   }
 
   static GqmNotification fromUint64(uint64_t value) {
     return GqmNotification{
-        static_cast<uint32_t>(value >> 32),
-        static_cast<uint32_t>(value & 0xFFFFFFFF)};
+        static_cast<uint16_t>(value >> 48),
+        static_cast<uint32_t>((value >> 16) & 0xFFFFFFFF),
+        static_cast<uint16_t>(value & 0xFFFF)};
   }
 };
 
@@ -136,10 +145,14 @@ class DefaultGqmInterface : public GqmInterface {
  */
 class SharedMemoryGqm : public GqmInterface {
  public:
+  static constexpr size_t kDefaultQueueDepth = 496;
+
   /**
-   * Default queue depth (number of 64-bit entries).
+   * GQM region size: enough for kDefaultQueueDepth entries.
+   * The internal block size is determined by gqm_init; we reserve
+   * sufficient space and enforce 4 KB alignment at the allocation site.
    */
-  static constexpr size_t kDefaultQueueDepth = 1024;
+  static constexpr size_t kGqmRegionSize = 32 * 1024; // 32 KB
 
   /**
    * Create a new GQM queue in shared memory.
@@ -195,6 +208,41 @@ class SharedMemoryGqm : public GqmInterface {
   int fd_;
   void* mappedAddr_;
   size_t totalSize_;
+  bool isCreator_;
+};
+
+/**
+ * GQM backed by a MemoryRegion from ImportedMemoryProvider.
+ *
+ * Used when both processes share the same physical backing store (CXL):
+ * the GQM lives in the pre-mapped device file alongside the data regions.
+ *
+ *   Creator side:  ImportedGqm::create(region)  — calls gqm_init.
+ *   Importer side: ImportedGqm::open(region)    — attaches only.
+ */
+class ImportedGqm : public GqmInterface {
+ public:
+  static std::unique_ptr<ImportedGqm> create(
+      std::unique_ptr<MemoryRegion> region);
+  static std::unique_ptr<ImportedGqm> open(
+      std::unique_ptr<MemoryRegion> region);
+
+  ~ImportedGqm() override = default;
+
+  ImportedGqm(const ImportedGqm&) = delete;
+  ImportedGqm& operator=(const ImportedGqm&) = delete;
+
+  void push(const GqmNotification& notification) override;
+  folly::Optional<GqmNotification> pop() override;
+  bool empty() override;
+
+  const std::string& name() const { return region_->name(); }
+  size_t offset() const { return region_->offset(); }
+
+ private:
+  ImportedGqm(std::unique_ptr<MemoryRegion> region, bool isCreator);
+
+  std::unique_ptr<MemoryRegion> region_;
   bool isCreator_;
 };
 

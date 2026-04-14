@@ -381,7 +381,7 @@ void SharedMemoryTransport::writeInternal(
 
 void SharedMemoryTransport::sendNotification(uint32_t offset, uint32_t length) {
   if (gqmInterface_) {
-    GqmNotification notification{offset, length};
+    GqmNotification notification{0, offset, static_cast<uint16_t>(length)};
     gqmInterface_->push(notification);
     notificationSent_++;
     XLOG(DBG) << "Sent notification: offset=" << offset << ", length=" << length;

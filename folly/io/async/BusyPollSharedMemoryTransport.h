@@ -36,6 +36,8 @@
 
 namespace folly {
 
+class ShmPollerService;
+
 /**
  * BusyPollSharedMemoryTransport implements AsyncTransport over shared memory
  * with GQM-based ring-queue notification for ultra-low-latency IPC.
@@ -74,16 +76,22 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
     uint32_t highLoadThreshold = 10;
     uint32_t sleepTimeoutUs = 100;
 
-    uint32_t maxChunkSize = GqmNotification::kMaxChunkSize;
+    uint16_t maxChunkSize = GqmNotification::kMaxChunkSize;
 
     std::shared_ptr<MemoryProvider> memoryProvider;
+
+    // Pool names for ImportedMemoryProvider (CXL device file path).
+    // writePoolName: pool where this side allocates write data + GQM.
+    // readPoolName:  pool where peer's write data + GQM reside (import).
+    std::string writePoolName;
+    std::string readPoolName;
 
     bool debugLogging = false;
   };
 
   /**
    * Create from pre-established memory regions and GQM queues (after
-   * the handshake completes).
+   * the handshake completes).  Legacy per-connection mode.
    */
   static UniquePtr create(
       EventBase* evb,
@@ -92,6 +100,15 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
       std::unique_ptr<GqmInterface> gqmWrite,
       std::unique_ptr<GqmInterface> gqmRead,
       const Config& config = {});
+
+  /**
+   * Create a lightweight transport backed by a shared ShmPollerService.
+   * The transport does not own GQM/data regions or poller threads.
+   */
+  static UniquePtr createShared(
+      EventBase* evb,
+      ShmPollerService* pollerService,
+      uint16_t connId);
 
   ~BusyPollSharedMemoryTransport() override;
 
@@ -152,7 +169,15 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   void checkForAvailableData();
   bool pollAndDeliver();
 
+  /**
+   * Called by ShmPollerService poller thread (via EventBase dispatch).
+   * Delivers data to the readCallback using readBufferAvailable (zero-copy)
+   * when supported, falling back to getReadBuffer + memcpy otherwise.
+   */
+  void onDataReceived(std::unique_ptr<IOBuf> data);
+
   GqmInterface* getGqmRead() { return gqmRead_.get(); }
+  uint16_t connId() const { return connId_; }
 
   struct Stats {
     uint64_t bytesWritten{0};
@@ -174,6 +199,11 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
       std::unique_ptr<GqmInterface> gqmWrite,
       std::unique_ptr<GqmInterface> gqmRead,
       const Config& config);
+
+  BusyPollSharedMemoryTransport(
+      EventBase* evb,
+      ShmPollerService* pollerService,
+      uint16_t connId);
 
   void writeInternal(
       WriteCallback* callback,
@@ -200,6 +230,9 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
 
   EventBase* evb_;
   std::atomic<State> state_{State::CONNECTED};
+
+  ShmPollerService* pollerService_{nullptr};
+  uint16_t connId_{0};
 
   // Flat data regions (no internal ring-buffer logic)
   std::unique_ptr<MemoryRegion> writeDataRegion_;

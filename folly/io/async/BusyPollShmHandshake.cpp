@@ -23,6 +23,7 @@
 #include <folly/Format.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/async/ImportedMemoryProvider.h>
 #include <folly/io/async/PosixShmProvider.h>
 #include <folly/logging/xlog.h>
 
@@ -30,38 +31,56 @@ namespace folly {
 
 namespace {
 
-constexpr uint32_t kHandshakeVersion = 2; // v2: added maxChunkSize field
+constexpr uint32_t kHandshakeVersion = 3; // v3: pool offsets + GQM on shared mem
 constexpr size_t kFrameHeaderSize = 4;
 
-size_t handshakePayloadSize(const ShmHandshakeInfo& info) {
-  return 4 + // magic
-      4 + // version
-      4 + info.writeShmName.size() +
-      8 + // dataRegionSize
-      4 + info.gqmWriteName.size() +
-      4 + // gqmQueueDepth
-      4; // maxChunkSize
+// ---- Serialization helpers ----
+
+void writeString(io::Appender& a, const std::string& s) {
+  a.writeBE<uint32_t>(static_cast<uint32_t>(s.size()));
+  a.push(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+}
+
+bool readString(io::Cursor& c, std::string& s, uint32_t maxLen = 256) {
+  auto len = c.readBE<uint32_t>();
+  if (len > maxLen) {
+    XLOG(ERR) << "Handshake string too long: " << len;
+    return false;
+  }
+  s.resize(len);
+  c.pull(s.data(), len);
+  return true;
 }
 
 std::unique_ptr<IOBuf> serializeHandshakeInfo(const ShmHandshakeInfo& info) {
-  size_t payloadSize = handshakePayloadSize(info);
+  size_t payloadSize =
+      4 + // magic
+      4 + // version
+      (4 + info.writeShmName.size()) +
+      8 + // dataRegionSize
+      8 + // dataRegionOffset
+      (4 + info.gqmWriteName.size()) +
+      4 + // gqmQueueDepth
+      8 + // gqmRegionOffset
+      8 + // gqmRegionSize
+      4 + // maxChunkSize
+      (4 + info.writePoolName.size());
+
   auto buf = IOBuf::create(kFrameHeaderSize + payloadSize);
   io::Appender appender(buf.get(), 0);
 
   appender.writeBE<uint32_t>(static_cast<uint32_t>(payloadSize));
   appender.writeBE<uint32_t>(ShmHandshakeInfo::kMagic);
   appender.writeBE<uint32_t>(kHandshakeVersion);
-  appender.writeBE<uint32_t>(static_cast<uint32_t>(info.writeShmName.size()));
-  appender.push(
-      reinterpret_cast<const uint8_t*>(info.writeShmName.data()),
-      info.writeShmName.size());
+  writeString(appender, info.writeShmName);
   appender.writeBE<uint64_t>(info.dataRegionSize);
-  appender.writeBE<uint32_t>(static_cast<uint32_t>(info.gqmWriteName.size()));
-  appender.push(
-      reinterpret_cast<const uint8_t*>(info.gqmWriteName.data()),
-      info.gqmWriteName.size());
+  appender.writeBE<uint64_t>(info.dataRegionOffset);
+  writeString(appender, info.gqmWriteName);
   appender.writeBE<uint32_t>(info.gqmQueueDepth);
+  appender.writeBE<uint64_t>(info.gqmRegionOffset);
+  appender.writeBE<uint64_t>(info.gqmRegionSize);
   appender.writeBE<uint32_t>(info.maxChunkSize);
+  writeString(appender, info.writePoolName);
 
   return buf;
 }
@@ -81,30 +100,29 @@ bool deserializeHandshakeInfo(const IOBuf* buf, ShmHandshakeInfo& info) {
     return false;
   }
 
-  auto nameLen = cursor.readBE<uint32_t>();
-  if (nameLen > 256) {
-    XLOG(ERR) << "Handshake name too long: " << nameLen;
-    return false;
-  }
-  info.writeShmName.resize(nameLen);
-  cursor.pull(info.writeShmName.data(), nameLen);
-
+  if (!readString(cursor, info.writeShmName)) return false;
   info.dataRegionSize = cursor.readBE<uint64_t>();
 
-  auto gqmNameLen = cursor.readBE<uint32_t>();
-  if (gqmNameLen > 256) {
-    XLOG(ERR) << "GQM name too long: " << gqmNameLen;
-    return false;
+  if (version >= 3) {
+    info.dataRegionOffset = cursor.readBE<uint64_t>();
   }
-  info.gqmWriteName.resize(gqmNameLen);
-  cursor.pull(info.gqmWriteName.data(), gqmNameLen);
 
+  if (!readString(cursor, info.gqmWriteName)) return false;
   info.gqmQueueDepth = cursor.readBE<uint32_t>();
+
+  if (version >= 3) {
+    info.gqmRegionOffset = cursor.readBE<uint64_t>();
+    info.gqmRegionSize = cursor.readBE<uint64_t>();
+  }
 
   if (version >= 2) {
     info.maxChunkSize = cursor.readBE<uint32_t>();
   } else {
     info.maxChunkSize = GqmNotification::kMaxChunkSize;
+  }
+
+  if (version >= 3) {
+    if (!readString(cursor, info.writePoolName)) return false;
   }
 
   return true;
@@ -252,10 +270,12 @@ ShmHandshakeResult shmHandshakeClient(
     AsyncTransport* sock,
     const BusyPollSharedMemoryTransport::Config& config) {
   auto& provider = resolveProvider(config);
+  bool sharedBacking = provider.usesSharedBackingStore();
 
   uint64_t uniqueId = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
 
+  // ---- Build local info ----
   ShmHandshakeInfo myInfo;
   myInfo.writeShmName =
       generateShmName(config.shmNamePrefix, false, uniqueId);
@@ -264,7 +284,32 @@ ShmHandshakeResult shmHandshakeClient(
       generateShmName("/thrift_gqm_", false, uniqueId);
   myInfo.gqmQueueDepth = SharedMemoryGqm::kDefaultQueueDepth;
   myInfo.maxChunkSize = config.maxChunkSize;
+  myInfo.writePoolName = config.writePoolName;
 
+  // ---- Allocate my write data + GQM ----
+  std::unique_ptr<MemoryRegion> writeRegion;
+  std::unique_ptr<GqmInterface> gqmWrite;
+
+  if (sharedBacking) {
+    auto& imported = static_cast<ImportedMemoryProvider&>(provider);
+    writeRegion = imported.createFromPool(
+        config.writePoolName, myInfo.writeShmName, config.dataRegionSize, 1);
+    myInfo.dataRegionOffset = writeRegion->offset();
+
+    auto gqmRegion = imported.createFromPool(
+        config.writePoolName, myInfo.gqmWriteName,
+        SharedMemoryGqm::kGqmRegionSize, 4096);
+    myInfo.gqmRegionOffset = gqmRegion->offset();
+    myInfo.gqmRegionSize = gqmRegion->size();
+    gqmWrite = ImportedGqm::create(std::move(gqmRegion));
+  } else {
+    writeRegion =
+        provider.create(myInfo.writeShmName, config.dataRegionSize);
+    gqmWrite = SharedMemoryGqm::create(
+        myInfo.gqmWriteName, myInfo.gqmQueueDepth);
+  }
+
+  // ---- Exchange ----
   auto sendBuf = serializeHandshakeInfo(myInfo);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error("Client handshake: failed to send info");
@@ -275,21 +320,38 @@ ShmHandshakeResult shmHandshakeClient(
     throw std::runtime_error("Client handshake: failed to read peer info");
   }
 
-  auto writeRegion =
-      provider.create(myInfo.writeShmName, config.dataRegionSize);
-  auto readRegion =
-      provider.import(peerInfo.writeShmName, peerInfo.dataRegionSize);
+  // ---- Import peer's write region + GQM ----
+  std::unique_ptr<MemoryRegion> readRegion;
+  std::unique_ptr<GqmInterface> gqmRead;
 
-  auto gqmWrite = SharedMemoryGqm::create(
-      myInfo.gqmWriteName, myInfo.gqmQueueDepth);
-  auto gqmRead = SharedMemoryGqm::open(
-      peerInfo.gqmWriteName, peerInfo.gqmQueueDepth);
+  if (sharedBacking) {
+    auto& imported = static_cast<ImportedMemoryProvider&>(provider);
+    readRegion = imported.importFromPool(
+        config.readPoolName,
+        peerInfo.writeShmName,
+        peerInfo.dataRegionOffset,
+        peerInfo.dataRegionSize);
+
+    auto gqmRegion = imported.importFromPool(
+        config.readPoolName,
+        peerInfo.gqmWriteName,
+        peerInfo.gqmRegionOffset,
+        peerInfo.gqmRegionSize);
+    gqmRead = ImportedGqm::open(std::move(gqmRegion));
+  } else {
+    readRegion =
+        provider.import(peerInfo.writeShmName, peerInfo.dataRegionSize);
+    gqmRead = SharedMemoryGqm::open(
+        peerInfo.gqmWriteName, peerInfo.gqmQueueDepth);
+  }
 
   sock->close();
 
   XLOG(DBG5) << "Client handshake complete: writeRegion="
              << myInfo.writeShmName
-             << ", maxChunkSize=" << myInfo.maxChunkSize;
+             << " (offset=" << myInfo.dataRegionOffset << ")"
+             << ", maxChunkSize=" << myInfo.maxChunkSize
+             << ", sharedBacking=" << sharedBacking;
 
   return ShmHandshakeResult{
       std::move(writeRegion),
@@ -305,15 +367,18 @@ ShmHandshakeResult shmHandshakeServer(
     AsyncTransport* sock,
     const BusyPollSharedMemoryTransport::Config& config) {
   auto& provider = resolveProvider(config);
+  bool sharedBacking = provider.usesSharedBackingStore();
 
   uint64_t uniqueId = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
 
+  // ---- Read client info first ----
   ShmHandshakeInfo clientInfo;
   if (!readFramedHandshake(evb, sock, clientInfo)) {
     throw std::runtime_error("Server handshake: failed to read client info");
   }
 
+  // ---- Build my info ----
   ShmHandshakeInfo myInfo;
   myInfo.writeShmName =
       generateShmName(config.shmNamePrefix, true, uniqueId);
@@ -322,33 +387,188 @@ ShmHandshakeResult shmHandshakeServer(
       generateShmName("/thrift_gqm_", true, uniqueId);
   myInfo.gqmQueueDepth = SharedMemoryGqm::kDefaultQueueDepth;
   myInfo.maxChunkSize = config.maxChunkSize;
+  myInfo.writePoolName = config.writePoolName;
 
+  // ---- Allocate my write data + GQM ----
+  std::unique_ptr<MemoryRegion> writeRegion;
+  std::unique_ptr<GqmInterface> gqmWrite;
+
+  if (sharedBacking) {
+    auto& imported = static_cast<ImportedMemoryProvider&>(provider);
+    writeRegion = imported.createFromPool(
+        config.writePoolName, myInfo.writeShmName, config.dataRegionSize, 1);
+    myInfo.dataRegionOffset = writeRegion->offset();
+
+    auto gqmRegion = imported.createFromPool(
+        config.writePoolName, myInfo.gqmWriteName,
+        SharedMemoryGqm::kGqmRegionSize, 4096);
+    myInfo.gqmRegionOffset = gqmRegion->offset();
+    myInfo.gqmRegionSize = gqmRegion->size();
+    gqmWrite = ImportedGqm::create(std::move(gqmRegion));
+  } else {
+    writeRegion =
+        provider.create(myInfo.writeShmName, config.dataRegionSize);
+    gqmWrite = SharedMemoryGqm::create(
+        myInfo.gqmWriteName, myInfo.gqmQueueDepth);
+  }
+
+  // ---- Send my info ----
   auto sendBuf = serializeHandshakeInfo(myInfo);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error("Server handshake: failed to send info");
   }
 
-  auto writeRegion =
-      provider.create(myInfo.writeShmName, config.dataRegionSize);
-  auto readRegion =
-      provider.import(clientInfo.writeShmName, clientInfo.dataRegionSize);
+  // ---- Import client's write region + GQM ----
+  std::unique_ptr<MemoryRegion> readRegion;
+  std::unique_ptr<GqmInterface> gqmRead;
 
-  auto gqmWrite = SharedMemoryGqm::create(
-      myInfo.gqmWriteName, myInfo.gqmQueueDepth);
-  auto gqmRead = SharedMemoryGqm::open(
-      clientInfo.gqmWriteName, clientInfo.gqmQueueDepth);
+  if (sharedBacking) {
+    auto& imported = static_cast<ImportedMemoryProvider&>(provider);
+    readRegion = imported.importFromPool(
+        config.readPoolName,
+        clientInfo.writeShmName,
+        clientInfo.dataRegionOffset,
+        clientInfo.dataRegionSize);
+
+    auto gqmRegion = imported.importFromPool(
+        config.readPoolName,
+        clientInfo.gqmWriteName,
+        clientInfo.gqmRegionOffset,
+        clientInfo.gqmRegionSize);
+    gqmRead = ImportedGqm::open(std::move(gqmRegion));
+  } else {
+    readRegion =
+        provider.import(clientInfo.writeShmName, clientInfo.dataRegionSize);
+    gqmRead = SharedMemoryGqm::open(
+        clientInfo.gqmWriteName, clientInfo.gqmQueueDepth);
+  }
 
   sock->close();
 
   XLOG(DBG5) << "Server handshake complete: writeRegion="
              << myInfo.writeShmName
-             << ", maxChunkSize=" << myInfo.maxChunkSize;
+             << " (offset=" << myInfo.dataRegionOffset << ")"
+             << ", maxChunkSize=" << myInfo.maxChunkSize
+             << ", sharedBacking=" << sharedBacking;
 
   return ShmHandshakeResult{
       std::move(writeRegion),
       std::move(readRegion),
       std::move(gqmWrite),
       std::move(gqmRead)};
+}
+
+// ========== Shared-mode handshakes (connId exchange only) ==========
+
+namespace {
+
+constexpr uint32_t kSharedHandshakeMagic = 0x53484D53; // "SHMS"
+
+std::unique_ptr<IOBuf> serializeConnId(uint16_t connId) {
+  auto buf = IOBuf::create(kFrameHeaderSize + 8);
+  io::Appender appender(buf.get(), 0);
+  appender.writeBE<uint32_t>(8);
+  appender.writeBE<uint32_t>(kSharedHandshakeMagic);
+  appender.writeBE<uint16_t>(connId);
+  appender.writeBE<uint16_t>(0); // reserved
+  return buf;
+}
+
+bool deserializeConnId(const IOBuf* buf, uint16_t& connId) {
+  io::Cursor cursor(buf);
+  auto magic = cursor.readBE<uint32_t>();
+  if (magic != kSharedHandshakeMagic) {
+    XLOG(ERR) << "Invalid shared handshake magic: 0x" << std::hex << magic;
+    return false;
+  }
+  connId = cursor.readBE<uint16_t>();
+  return true;
+}
+
+} // namespace
+
+ShmSharedHandshakeResult shmHandshakeClientShared(
+    EventBase* evb,
+    AsyncTransport* sock,
+    uint16_t localConnId) {
+  auto sendBuf = serializeConnId(localConnId);
+  if (!syncWrite(evb, sock, std::move(sendBuf))) {
+    throw std::runtime_error(
+        "Shared handshake client: failed to send connId");
+  }
+
+  IOBufQueue readQueue;
+  if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
+    throw std::runtime_error(
+        "Shared handshake client: failed to read frame header");
+  }
+
+  io::Cursor headerCursor(readQueue.front());
+  uint32_t payloadLen = headerCursor.readBE<uint32_t>();
+  size_t totalNeeded = kFrameHeaderSize + payloadLen;
+  if (readQueue.chainLength() < totalNeeded) {
+    if (!syncRead(evb, sock, readQueue, totalNeeded)) {
+      throw std::runtime_error(
+          "Shared handshake client: failed to read payload");
+    }
+  }
+
+  readQueue.trimStart(kFrameHeaderSize);
+  auto payloadBuf = readQueue.move();
+  uint16_t peerConnId = 0;
+  if (!deserializeConnId(payloadBuf.get(), peerConnId)) {
+    throw std::runtime_error(
+        "Shared handshake client: failed to deserialize peer connId");
+  }
+
+  sock->close();
+
+  XLOG(DBG5) << "Shared handshake client complete: localConnId="
+             << localConnId << ", peerConnId=" << peerConnId;
+
+  return ShmSharedHandshakeResult{localConnId, peerConnId};
+}
+
+ShmSharedHandshakeResult shmHandshakeServerShared(
+    EventBase* evb,
+    AsyncTransport* sock,
+    uint16_t localConnId) {
+  IOBufQueue readQueue;
+  if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
+    throw std::runtime_error(
+        "Shared handshake server: failed to read frame header");
+  }
+
+  io::Cursor headerCursor(readQueue.front());
+  uint32_t payloadLen = headerCursor.readBE<uint32_t>();
+  size_t totalNeeded = kFrameHeaderSize + payloadLen;
+  if (readQueue.chainLength() < totalNeeded) {
+    if (!syncRead(evb, sock, readQueue, totalNeeded)) {
+      throw std::runtime_error(
+          "Shared handshake server: failed to read payload");
+    }
+  }
+
+  readQueue.trimStart(kFrameHeaderSize);
+  auto payloadBuf = readQueue.move();
+  uint16_t peerConnId = 0;
+  if (!deserializeConnId(payloadBuf.get(), peerConnId)) {
+    throw std::runtime_error(
+        "Shared handshake server: failed to deserialize peer connId");
+  }
+
+  auto sendBuf = serializeConnId(localConnId);
+  if (!syncWrite(evb, sock, std::move(sendBuf))) {
+    throw std::runtime_error(
+        "Shared handshake server: failed to send connId");
+  }
+
+  sock->close();
+
+  XLOG(DBG5) << "Shared handshake server complete: localConnId="
+             << localConnId << ", peerConnId=" << peerConnId;
+
+  return ShmSharedHandshakeResult{localConnId, peerConnId};
 }
 
 } // namespace folly

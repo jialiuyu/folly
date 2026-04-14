@@ -23,6 +23,7 @@
 #include <folly/Format.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/async/ShmPollerService.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/SysUio.h>
 
@@ -167,6 +168,58 @@ BusyPollSharedMemoryTransport::create(
   return transport;
 }
 
+// ========== Shared-mode construction ==========
+
+BusyPollSharedMemoryTransport::BusyPollSharedMemoryTransport(
+    EventBase* evb,
+    ShmPollerService* pollerService,
+    uint16_t connId)
+    : evb_(evb),
+      pollerService_(pollerService),
+      connId_(connId) {
+  state_ = State::CONNECTED;
+  XLOG(DBG5) << "BusyPollSharedMemoryTransport(shared) created, connId="
+             << connId;
+}
+
+BusyPollSharedMemoryTransport::UniquePtr
+BusyPollSharedMemoryTransport::createShared(
+    EventBase* evb,
+    ShmPollerService* pollerService,
+    uint16_t connId) {
+  return UniquePtr(new BusyPollSharedMemoryTransport(
+      evb, pollerService, connId));
+}
+
+// ========== Poller dispatch: onDataReceived ==========
+
+void BusyPollSharedMemoryTransport::onDataReceived(
+    std::unique_ptr<IOBuf> data) {
+  if (state_ != State::CONNECTED || !readCallback_) {
+    return;
+  }
+
+  size_t dataLen = data->computeChainDataLength();
+  bytesRead_ += dataLen;
+  readCount_++;
+
+  if (readCallback_->isBufferMovable()) {
+    readCallback_->readBufferAvailable(std::move(data));
+  } else {
+    void* buf = nullptr;
+    size_t bufLen = 0;
+    readCallback_->getReadBuffer(&buf, &bufLen);
+    if (!buf || bufLen == 0) {
+      readCallback_->readErr(AsyncSocketException(
+          AsyncSocketException::INVALID_STATE, "Invalid read buffer"));
+      return;
+    }
+    size_t toCopy = std::min(bufLen, dataLen);
+    std::memcpy(buf, data->data(), toCopy);
+    readCallback_->readDataAvailable(toCopy);
+  }
+}
+
 // ========== AsyncTransport read ==========
 
 void BusyPollSharedMemoryTransport::setReadCB(ReadCallback* callback) {
@@ -235,6 +288,23 @@ void BusyPollSharedMemoryTransport::writeInternal(
     WriteCallback* callback,
     std::unique_ptr<IOBuf> buf,
     WriteFlags /*flags*/) {
+
+  // Shared mode: delegate to ShmPollerService
+  if (pollerService_) {
+    size_t totalWritten = 0;
+    for (auto& iov : *buf) {
+      pollerService_->writeData(connId_, iov.data(), iov.size());
+      totalWritten += iov.size();
+    }
+    bytesWritten_ += totalWritten;
+    writeCount_++;
+    if (callback) {
+      callback->writeSuccess();
+    }
+    return;
+  }
+
+  // Legacy per-connection mode
   if (!writeDataRegion_) {
     if (callback) {
       callback->writeErr(
@@ -266,7 +336,7 @@ void BusyPollSharedMemoryTransport::writeInternal(
       }
 
       gqmWrite_->push(
-          {offset, static_cast<uint32_t>(chunkLen)});
+          GqmNotification{0, offset, static_cast<uint16_t>(chunkLen)});
       gqmPushCount_++;
 
       writeCursor_ += chunkLen;
@@ -376,6 +446,10 @@ void BusyPollSharedMemoryTransport::closeNow() {
   State oldState = state_.exchange(State::CLOSED);
   if (oldState == State::CLOSED) {
     return;
+  }
+
+  if (pollerService_ && connId_ > 0) {
+    pollerService_->unregisterTransport(connId_);
   }
 
   stopPollerThread();

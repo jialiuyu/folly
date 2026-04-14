@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -26,7 +27,7 @@
 namespace folly {
 
 /**
- * Result of a shared memory handshake.
+ * Result of a per-connection (legacy) shared memory handshake.
  */
 struct ShmHandshakeResult {
   std::unique_ptr<MemoryRegion> writeRegion;
@@ -36,23 +37,32 @@ struct ShmHandshakeResult {
 };
 
 /**
+ * Result of a shared-mode handshake (connId exchange only).
+ */
+struct ShmSharedHandshakeResult {
+  uint16_t localConnId{0};
+  uint16_t peerConnId{0};
+};
+
+/**
  * Info exchanged over the bootstrap socket during the SHM handshake.
  */
 struct ShmHandshakeInfo {
   std::string writeShmName;
   uint64_t dataRegionSize{0};
+  uint64_t dataRegionOffset{0};
   std::string gqmWriteName;
   uint32_t gqmQueueDepth{0};
+  uint64_t gqmRegionOffset{0};
+  uint64_t gqmRegionSize{0};
   uint32_t maxChunkSize{0};
+  std::string writePoolName;
 
   static constexpr uint32_t kMagic = 0x53484D54; // "SHMT"
 };
 
 /**
- * Client-side SHM handshake.
- *
- * Uses config.memoryProvider (falls back to PosixShmProvider) to
- * create/import data regions.
+ * Client-side SHM handshake (legacy per-connection mode).
  */
 ShmHandshakeResult shmHandshakeClient(
     EventBase* evb,
@@ -60,11 +70,29 @@ ShmHandshakeResult shmHandshakeClient(
     const BusyPollSharedMemoryTransport::Config& config = {});
 
 /**
- * Server-side SHM handshake.
+ * Server-side SHM handshake (legacy per-connection mode).
  */
 ShmHandshakeResult shmHandshakeServer(
     EventBase* evb,
     AsyncTransport* sock,
     const BusyPollSharedMemoryTransport::Config& config = {});
+
+/**
+ * Client-side shared-mode handshake.
+ * Exchanges connId with the server over the bootstrap socket.
+ * Shared GQM / data regions are pre-initialized by ShmPollerService.
+ */
+ShmSharedHandshakeResult shmHandshakeClientShared(
+    EventBase* evb,
+    AsyncTransport* sock,
+    uint16_t localConnId);
+
+/**
+ * Server-side shared-mode handshake.
+ */
+ShmSharedHandshakeResult shmHandshakeServerShared(
+    EventBase* evb,
+    AsyncTransport* sock,
+    uint16_t localConnId);
 
 } // namespace folly
