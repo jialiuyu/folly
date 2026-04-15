@@ -98,8 +98,15 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
       std::unique_ptr<MemoryRegion> writeDataRegion,
       std::unique_ptr<MemoryRegion> readDataRegion,
       std::unique_ptr<GqmInterface> gqmWrite,
+      std::unique_ptr<GqmInterface> gqmRead);
+
+  static UniquePtr create(
+      EventBase* evb,
+      std::unique_ptr<MemoryRegion> writeDataRegion,
+      std::unique_ptr<MemoryRegion> readDataRegion,
+      std::unique_ptr<GqmInterface> gqmWrite,
       std::unique_ptr<GqmInterface> gqmRead,
-      const Config& config = {});
+      const Config& config);
 
   /**
    * Create a lightweight transport backed by a shared ShmPollerService.
@@ -108,7 +115,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   static UniquePtr createShared(
       EventBase* evb,
       ShmPollerService* pollerService,
-      uint16_t connId);
+      uint16_t localConnId,
+      uint16_t peerConnId);
 
   ~BusyPollSharedMemoryTransport() override;
 
@@ -156,6 +164,7 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
 
   void getLocalAddress(SocketAddress* address) const override;
   void getPeerAddress(SocketAddress* address) const override;
+  EventBase* getEventBase() const override { return evb_; }
 
   bool isEorTrackingEnabled() const override { return eorTrackingEnabled_; }
   void setEorTracking(bool track) override { eorTrackingEnabled_ = track; }
@@ -177,7 +186,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   void onDataReceived(std::unique_ptr<IOBuf> data);
 
   GqmInterface* getGqmRead() { return gqmRead_.get(); }
-  uint16_t connId() const { return connId_; }
+  uint16_t localConnId() const { return localConnId_; }
+  uint16_t peerConnId() const { return peerConnId_; }
 
   struct Stats {
     uint64_t bytesWritten{0};
@@ -203,7 +213,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   BusyPollSharedMemoryTransport(
       EventBase* evb,
       ShmPollerService* pollerService,
-      uint16_t connId);
+      uint16_t localConnId,
+      uint16_t peerConnId);
 
   void writeInternal(
       WriteCallback* callback,
@@ -232,7 +243,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   std::atomic<State> state_{State::CONNECTED};
 
   ShmPollerService* pollerService_{nullptr};
-  uint16_t connId_{0};
+  uint16_t localConnId_{0};
+  uint16_t peerConnId_{0};
 
   // Flat data regions (no internal ring-buffer logic)
   std::unique_ptr<MemoryRegion> writeDataRegion_;

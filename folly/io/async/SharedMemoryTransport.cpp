@@ -290,7 +290,7 @@ void SharedMemoryTransport::writev(
     const iovec* vec,
     size_t count,
     WriteFlags flags) {
-  auto ioBuf = IOBuf::fromIovec(vec, count);
+  auto ioBuf = IOBuf::wrapIov(vec, count);
   writeChain(callback, std::move(ioBuf), flags);
 }
 

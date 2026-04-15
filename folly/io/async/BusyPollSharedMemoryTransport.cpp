@@ -134,6 +134,22 @@ BusyPollSharedMemoryTransport::create(
     std::unique_ptr<MemoryRegion> writeDataRegion,
     std::unique_ptr<MemoryRegion> readDataRegion,
     std::unique_ptr<GqmInterface> gqmWrite,
+    std::unique_ptr<GqmInterface> gqmRead) {
+  return create(
+      evb,
+      std::move(writeDataRegion),
+      std::move(readDataRegion),
+      std::move(gqmWrite),
+      std::move(gqmRead),
+      Config{});
+}
+
+BusyPollSharedMemoryTransport::UniquePtr
+BusyPollSharedMemoryTransport::create(
+    EventBase* evb,
+    std::unique_ptr<MemoryRegion> writeDataRegion,
+    std::unique_ptr<MemoryRegion> readDataRegion,
+    std::unique_ptr<GqmInterface> gqmWrite,
     std::unique_ptr<GqmInterface> gqmRead,
     const Config& config) {
   if (!writeDataRegion || !readDataRegion || !gqmWrite || !gqmRead) {
@@ -173,22 +189,25 @@ BusyPollSharedMemoryTransport::create(
 BusyPollSharedMemoryTransport::BusyPollSharedMemoryTransport(
     EventBase* evb,
     ShmPollerService* pollerService,
-    uint16_t connId)
+    uint16_t localConnId,
+    uint16_t peerConnId)
     : evb_(evb),
       pollerService_(pollerService),
-      connId_(connId) {
+      localConnId_(localConnId),
+      peerConnId_(peerConnId) {
   state_ = State::CONNECTED;
-  XLOG(DBG5) << "BusyPollSharedMemoryTransport(shared) created, connId="
-             << connId;
+  XLOG(DBG5) << "BusyPollSharedMemoryTransport(shared) created, localConnId="
+             << localConnId << ", peerConnId=" << peerConnId;
 }
 
 BusyPollSharedMemoryTransport::UniquePtr
 BusyPollSharedMemoryTransport::createShared(
     EventBase* evb,
     ShmPollerService* pollerService,
-    uint16_t connId) {
+    uint16_t localConnId,
+    uint16_t peerConnId) {
   return UniquePtr(new BusyPollSharedMemoryTransport(
-      evb, pollerService, connId));
+      evb, pollerService, localConnId, peerConnId));
 }
 
 // ========== Poller dispatch: onDataReceived ==========
@@ -206,23 +225,23 @@ void BusyPollSharedMemoryTransport::onDataReceived(
   if (readCallback_->isBufferMovable()) {
     readCallback_->readBufferAvailable(std::move(data));
   } else {
-    void* buf = nullptr;
-    size_t bufLen = 0;
-    readCallback_->getReadBuffer(&buf, &bufLen);
-    if (!buf || bufLen == 0) {
-      readCallback_->readErr(AsyncSocketException(
-          AsyncSocketException::INVALID_STATE, "Invalid read buffer"));
-      return;
-    }
-    size_t toCopy = std::min(bufLen, dataLen);
-    std::memcpy(buf, data->data(), toCopy);
-    readCallback_->readDataAvailable(toCopy);
+    readCallback_->readErr(AsyncSocketException(
+        AsyncSocketException::INVALID_STATE,
+        "Shared-mode SHM transport only supports movable read callbacks"));
   }
 }
 
 // ========== AsyncTransport read ==========
 
 void BusyPollSharedMemoryTransport::setReadCB(ReadCallback* callback) {
+  if (pollerService_ && callback && !callback->isBufferMovable()) {
+    state_ = State::ERROR;
+    callback->readErr(AsyncSocketException(
+        AsyncSocketException::INVALID_STATE,
+        "Shared-mode SHM transport requires movable read callbacks"));
+    readCallback_ = nullptr;
+    return;
+  }
   readCallback_ = callback;
   if (callback && state_ == State::CONNECTED) {
     deliverReadData();
@@ -292,8 +311,18 @@ void BusyPollSharedMemoryTransport::writeInternal(
   // Shared mode: delegate to ShmPollerService
   if (pollerService_) {
     size_t totalWritten = 0;
+    if (peerConnId_ == 0) {
+      if (callback) {
+        callback->writeErr(
+            0,
+            AsyncSocketException(
+                AsyncSocketException::INVALID_STATE,
+                "Shared-mode SHM transport is missing peer connId"));
+      }
+      return;
+    }
     for (auto& iov : *buf) {
-      pollerService_->writeData(connId_, iov.data(), iov.size());
+      pollerService_->writeData(peerConnId_, iov.data(), iov.size());
       totalWritten += iov.size();
     }
     bytesWritten_ += totalWritten;
@@ -448,8 +477,8 @@ void BusyPollSharedMemoryTransport::closeNow() {
     return;
   }
 
-  if (pollerService_ && connId_ > 0) {
-    pollerService_->unregisterTransport(connId_);
+  if (pollerService_ && localConnId_ > 0) {
+    pollerService_->unregisterTransport(localConnId_);
   }
 
   stopPollerThread();
@@ -511,6 +540,9 @@ bool BusyPollSharedMemoryTransport::readable() const {
 }
 
 bool BusyPollSharedMemoryTransport::writable() const {
+  if (pollerService_) {
+    return good() && peerConnId_ != 0;
+  }
   return good() && writeDataRegion_;
 }
 

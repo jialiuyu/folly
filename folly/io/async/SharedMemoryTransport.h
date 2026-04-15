@@ -172,6 +172,7 @@ class SharedMemoryTransport
   // Address methods
   void getLocalAddress(SocketAddress* address) const override;
   void getPeerAddress(SocketAddress* address) const override;
+  EventBase* getEventBase() const override { return evb_; }
 
   // EOR tracking
   bool isEorTrackingEnabled() const override { return eorTrackingEnabled_; }
@@ -303,7 +304,7 @@ class SharedMemoryTransport
     size_t totalBytes{0};
   };
   std::deque<WriteRequest> pendingWrites_;
-  std::mutex writeMutex_;
+  mutable std::mutex writeMutex_;
 
   // Read state
   IOBufQueue readBufQueue_;
