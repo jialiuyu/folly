@@ -16,6 +16,9 @@
 
 #include <folly/io/async/GqmInterface.h>
 
+#include <folly/io/async/gqm_common.h>
+
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
@@ -29,40 +32,66 @@
 
 namespace folly {
 
-// ========== External GQM C functions ==========
-// These functions should be provided by your hardware queue library.
-// Each function takes a queue pointer to identify which queue to operate on.
-extern "C" {
-int gqm_init(void* queue, size_t size);
-void gqm_push(void* queue, void* msg, size_t len);
-void* gqm_pop(void* queue);
-int gqm_empty(void* queue);
+namespace {
+
+constexpr size_t kUgqmHeaderBytes() {
+  /* Must match struct layout in ugqm_stub.c / vendor ugqm implementation. */
+  return 3 * sizeof(uint64_t);
 }
+
+uint32_t ugqmLengthFromRegionBytes(size_t regionBytes) {
+  if (regionBytes <= kUgqmHeaderBytes()) {
+    return 0;
+  }
+  size_t slots = (regionBytes - kUgqmHeaderBytes()) / sizeof(uint64_t);
+  if (slots == 0) {
+    return 0;
+  }
+  if (slots > static_cast<size_t>(UINT32_MAX)) {
+    return UINT32_MAX;
+  }
+  return static_cast<uint32_t>(slots);
+}
+
+folly::Optional<GqmNotification> ugqmPopNotification(void* queue) {
+  uint64_t raw = 0;
+  uint64_t ret = ugqm_pop(queue, &raw);
+  if (GQM_RET_ERR(ret) == GQM_ERR_EMPTY) {
+    return folly::none;
+  }
+  if (GQM_RET_ERR(ret) != GQM_ERR_OK) {
+    return folly::none;
+  }
+  return GqmNotification::fromUint64(raw);
+}
+
+void ugqmPushNotification(void* queue, const GqmNotification& notification) {
+  uint64_t msg = notification.toUint64();
+  uint64_t ret = ugqm_push(queue, msg);
+  if (GQM_RET_ERR(ret) != GQM_ERR_OK) {
+    XLOG(ERR) << "ugqm_push failed, err=" << GQM_RET_ERR(ret);
+  }
+}
+
+} // namespace
 
 // ========== DefaultGqmInterface Implementation ==========
 
 bool DefaultGqmInterface::init(void* mem, size_t size) {
-  return gqm_init(mem, size) == 0;
+  uint32_t length = ugqmLengthFromRegionBytes(size);
+  if (length == 0) {
+    return false;
+  }
+  uint64_t ret = ugqm_withdata_init(mem, length);
+  return GQM_RET_ERR(ret) == GQM_ERR_OK;
 }
 
 void DefaultGqmInterface::push(const GqmNotification& notification) {
-  uint64_t msg = notification.toUint64();
-  gqm_push(queueMem_, &msg, sizeof(msg));
+  ugqmPushNotification(queueMem_, notification);
 }
 
 folly::Optional<GqmNotification> DefaultGqmInterface::pop() {
-  void* result = gqm_pop(queueMem_);
-  if (result == nullptr) {
-    return folly::none;
-  }
-
-  uint64_t msg;
-  std::memcpy(&msg, result, sizeof(msg));
-  return GqmNotification::fromUint64(msg);
-}
-
-bool DefaultGqmInterface::empty() {
-  return gqm_empty(queueMem_) != 0;
+  return ugqmPopNotification(queueMem_);
 }
 
 // ========== SharedMemoryGqm Implementation ==========
@@ -83,6 +112,12 @@ SharedMemoryGqm::SharedMemoryGqm(
 
 SharedMemoryGqm::~SharedMemoryGqm() {
   if (mappedAddr_ != nullptr && mappedAddr_ != MAP_FAILED) {
+    if (isCreator_) {
+      uint64_t dret = ugqm_deinit(mappedAddr_);
+      if (GQM_RET_ERR(dret) != GQM_ERR_OK) {
+        XLOG(WARN) << "ugqm_deinit failed, err=" << GQM_RET_ERR(dret);
+      }
+    }
     ::munmap(mappedAddr_, totalSize_);
   }
   if (fd_ >= 0) {
@@ -133,13 +168,16 @@ std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::create(
         strerror(savedErrno)));
   }
 
-  // Initialize with gqm_init
-  if (gqm_init(mappedAddr, totalSize) != 0) {
+  uint64_t iret = ugqm_withdata_init(
+      mappedAddr, static_cast<uint32_t>(queueDepth));
+  if (GQM_RET_ERR(iret) != GQM_ERR_OK) {
     ::munmap(mappedAddr, totalSize);
     ::close(fd);
     ::shm_unlink(name.c_str());
     throw std::runtime_error(folly::sformat(
-        "Failed to gqm_init GQM shared memory {}", name));
+        "Failed to ugqm_withdata_init GQM shared memory {} err={}",
+        name,
+        GQM_RET_ERR(iret)));
   }
 
   return std::unique_ptr<SharedMemoryGqm>(
@@ -193,23 +231,11 @@ std::unique_ptr<SharedMemoryGqm> SharedMemoryGqm::open(
 }
 
 void SharedMemoryGqm::push(const GqmNotification& notification) {
-  uint64_t msg = notification.toUint64();
-  gqm_push(mappedAddr_, &msg, sizeof(msg));
+  ugqmPushNotification(mappedAddr_, notification);
 }
 
 folly::Optional<GqmNotification> SharedMemoryGqm::pop() {
-  void* result = gqm_pop(mappedAddr_);
-  if (result == nullptr) {
-    return folly::none;
-  }
-
-  uint64_t msg;
-  std::memcpy(&msg, result, sizeof(msg));
-  return GqmNotification::fromUint64(msg);
-}
-
-bool SharedMemoryGqm::empty() {
-  return gqm_empty(mappedAddr_) != 0;
+  return ugqmPopNotification(mappedAddr_);
 }
 
 // ========== ImportedGqm Implementation ==========
@@ -220,10 +246,18 @@ ImportedGqm::ImportedGqm(
 
 std::unique_ptr<ImportedGqm> ImportedGqm::create(
     std::unique_ptr<MemoryRegion> region) {
-  if (gqm_init(region->data(), region->size()) != 0) {
+  uint32_t length = ugqmLengthFromRegionBytes(region->size());
+  if (length == 0) {
     throw std::runtime_error(folly::sformat(
-        "ImportedGqm::create: gqm_init failed for region '{}'",
+        "ImportedGqm::create: region '{}' too small for ugqm",
         region->name()));
+  }
+  uint64_t iret = ugqm_withdata_init(region->data(), length);
+  if (GQM_RET_ERR(iret) != GQM_ERR_OK) {
+    throw std::runtime_error(folly::sformat(
+        "ImportedGqm::create: ugqm_withdata_init failed for region '{}' err={}",
+        region->name(),
+        GQM_RET_ERR(iret)));
   }
   XLOG(DBG5) << "ImportedGqm created: " << region->name()
              << ", offset=" << region->offset()
@@ -242,22 +276,20 @@ std::unique_ptr<ImportedGqm> ImportedGqm::open(
 }
 
 void ImportedGqm::push(const GqmNotification& notification) {
-  uint64_t msg = notification.toUint64();
-  gqm_push(region_->data(), &msg, sizeof(msg));
+  ugqmPushNotification(region_->data(), notification);
 }
 
 folly::Optional<GqmNotification> ImportedGqm::pop() {
-  void* result = gqm_pop(region_->data());
-  if (result == nullptr) {
-    return folly::none;
-  }
-  uint64_t msg;
-  std::memcpy(&msg, result, sizeof(msg));
-  return GqmNotification::fromUint64(msg);
+  return ugqmPopNotification(region_->data());
 }
 
-bool ImportedGqm::empty() {
-  return gqm_empty(region_->data()) != 0;
+ImportedGqm::~ImportedGqm() {
+  if (isCreator_ && region_ && region_->data()) {
+    uint64_t dret = ugqm_deinit(region_->data());
+    if (GQM_RET_ERR(dret) != GQM_ERR_OK) {
+      XLOG(WARN) << "ugqm_deinit failed, err=" << GQM_RET_ERR(dret);
+    }
+  }
 }
 
 } // namespace folly

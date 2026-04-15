@@ -99,7 +99,7 @@ class ShmPollerService {
    *   1. GQM region (32KB, 4KB-aligned) from the named pool
    *   2. Data region (remaining pool space) from the named pool
    *
-   * The GQM creator calls gqm_init; the peer calls ImportedGqm::open.
+   * The GQM creator calls ugqm_withdata_init; the peer calls ImportedGqm::open.
    *
    * @param provider  The ImportedMemoryProvider with registered pools
    * @param writePool Pool name for this side's write direction

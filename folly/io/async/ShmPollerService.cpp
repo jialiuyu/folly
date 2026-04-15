@@ -147,7 +147,7 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
     uint32_t offset = notif->offset;
     uint16_t length = notif->length;
 
-    auto chunk = IOBuf::create(length);
+    auto chunk = IOBuf::create(std::max(size_t(1), static_cast<size_t>(length)));
     size_t firstPart = std::min(
         static_cast<size_t>(length),
         ctx.usableSize - static_cast<size_t>(offset));

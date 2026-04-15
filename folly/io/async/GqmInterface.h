@@ -83,26 +83,19 @@ class GqmInterface {
    */
   virtual folly::Optional<GqmNotification> pop() = 0;
 
-  /**
-   * Check if the queue is empty without consuming any notifications.
-   */
-  virtual bool empty() = 0;
 };
 
 /**
- * Default GQM implementation using the provided C functions.
+ * Default GQM implementation using the vendor C API from gqm_common.h:
  *
- * IMPORTANT: The following C functions must be linked:
- *   int  gqm_init(void* queue, size_t size);
- *   void gqm_push(void* queue, void* msg, size_t len);
- *   void* gqm_pop(void* queue);
+ *   uint64_t ugqm_withdata_init(void* gqm, uint32_t length);
+ *   uint64_t ugqm_deinit(void* gqm);
+ *   uint64_t ugqm_push(void* gqm, uint64_t data);
+ *   uint64_t ugqm_pop(void* gqm, uint64_t* data);
  *
- * - gqm_init: Initialize a memory region as a GQM queue. Returns 0 on success.
- * - gqm_push: Atomically push a message to the specified queue. Thread-safe.
- * - gqm_pop: Atomically pop a message from the specified queue. Returns pointer
- *   to 64-bit message, or nullptr if empty. The message is consumed (read-once).
- *
- * All functions require a queue pointer obtained from gqm_init.
+ * Use GQM_RET_ERR(ret) with GQM_ERR_OK / GQM_ERR_EMPTY (and other vendor codes)
+ * to interpret return values. Initialization uses ugqm_withdata_init on the
+ * queue memory; length is derived from the region byte size.
  */
 class DefaultGqmInterface : public GqmInterface {
  public:
@@ -121,7 +114,6 @@ class DefaultGqmInterface : public GqmInterface {
 
   void push(const GqmNotification& notification) override;
   folly::Optional<GqmNotification> pop() override;
-  bool empty() override;
 
  private:
   void* queueMem_;
@@ -149,14 +141,14 @@ class SharedMemoryGqm : public GqmInterface {
 
   /**
    * GQM region size: enough for kDefaultQueueDepth entries.
-   * The internal block size is determined by gqm_init; we reserve
+   * The internal layout is determined by ugqm_withdata_init; we reserve
    * sufficient space and enforce 4 KB alignment at the allocation site.
    */
   static constexpr size_t kGqmRegionSize = 32 * 1024; // 32 KB
 
   /**
    * Create a new GQM queue in shared memory.
-   * The region is created with shm_open and initialized with gqm_init.
+   * The region is created with shm_open and initialized with ugqm_withdata_init.
    *
    * @param name Shared memory name (e.g., "/thrift_gqm_0")
    * @param queueDepth Number of 64-bit entries in the queue
@@ -184,7 +176,6 @@ class SharedMemoryGqm : public GqmInterface {
 
   void push(const GqmNotification& notification) override;
   folly::Optional<GqmNotification> pop() override;
-  bool empty() override;
 
   /**
    * Get the shared memory region name.
@@ -192,7 +183,7 @@ class SharedMemoryGqm : public GqmInterface {
   const std::string& name() const { return name_; }
 
   /**
-   * Get the raw memory pointer (for gqm_init or direct access).
+   * Get the raw memory pointer (for ugqm_* or direct access).
    */
   void* data() { return mappedAddr_; }
 
@@ -217,7 +208,7 @@ class SharedMemoryGqm : public GqmInterface {
  * Used when both processes share the same physical backing store (CXL):
  * the GQM lives in the pre-mapped device file alongside the data regions.
  *
- *   Creator side:  ImportedGqm::create(region)  — calls gqm_init.
+ *   Creator side:  ImportedGqm::create(region)  — calls ugqm_withdata_init.
  *   Importer side: ImportedGqm::open(region)    — attaches only.
  */
 class ImportedGqm : public GqmInterface {
@@ -227,14 +218,13 @@ class ImportedGqm : public GqmInterface {
   static std::unique_ptr<ImportedGqm> open(
       std::unique_ptr<MemoryRegion> region);
 
-  ~ImportedGqm() override = default;
+  ~ImportedGqm() override;
 
   ImportedGqm(const ImportedGqm&) = delete;
   ImportedGqm& operator=(const ImportedGqm&) = delete;
 
   void push(const GqmNotification& notification) override;
   folly::Optional<GqmNotification> pop() override;
-  bool empty() override;
 
   const std::string& name() const { return region_->name(); }
   size_t offset() const { return region_->offset(); }
@@ -256,8 +246,6 @@ class NullGqmInterface : public GqmInterface {
   }
 
   folly::Optional<GqmNotification> pop() override { return folly::none; }
-
-  bool empty() override { return true; }
 };
 
 } // namespace folly

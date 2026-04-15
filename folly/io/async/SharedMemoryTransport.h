@@ -29,6 +29,8 @@
 #include <folly/io/async/AsyncSocketException.h>
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/GqmInterface.h>
+#include <folly/io/async/MemoryProvider.h>
 #include <folly/io/async/SharedMemoryRegion.h>
 
 namespace folly {
@@ -109,8 +111,8 @@ class SharedMemoryTransport
    */
   static UniquePtr createFromRegions(
       EventBase* evb,
-      std::unique_ptr<SharedMemoryRegion> writeRegion,
-      std::unique_ptr<SharedMemoryRegion> readRegion,
+      std::unique_ptr<MemoryRegion> writeRegion,
+      std::unique_ptr<MemoryRegion> readRegion,
       std::shared_ptr<GqmInterface> gqmInterface = nullptr,
       const Config& config = {});
 
@@ -186,14 +188,14 @@ class SharedMemoryTransport
   /**
    * Get the write region (for testing/debugging)
    */
-  SharedMemoryRegion* getWriteRegion() { return writeRegion_.get(); }
-  const SharedMemoryRegion* getWriteRegion() const { return writeRegion_.get(); }
+  MemoryRegion* getWriteRegion() { return writeRegion_.get(); }
+  const MemoryRegion* getWriteRegion() const { return writeRegion_.get(); }
 
   /**
    * Get the read region (for testing/debugging)
    */
-  SharedMemoryRegion* getReadRegion() { return readRegion_.get(); }
-  const SharedMemoryRegion* getReadRegion() const { return readRegion_.get(); }
+  MemoryRegion* getReadRegion() { return readRegion_.get(); }
+  const MemoryRegion* getReadRegion() const { return readRegion_.get(); }
 
   /**
    * Set a callback to be notified when the transport is closed
@@ -224,8 +226,8 @@ class SharedMemoryTransport
   // Private constructor
   SharedMemoryTransport(
       EventBase* evb,
-      std::unique_ptr<SharedMemoryRegion> writeRegion,
-      std::unique_ptr<SharedMemoryRegion> readRegion,
+      std::unique_ptr<MemoryRegion> writeRegion,
+      std::unique_ptr<MemoryRegion> readRegion,
       std::shared_ptr<GqmInterface> gqmInterface,
       const Config& config);
 
@@ -278,14 +280,17 @@ class SharedMemoryTransport
   std::atomic<State> state_{State::HANDSHAKE};
 
   // Shared memory regions
-  std::unique_ptr<SharedMemoryRegion> writeRegion_;  // We write, peer reads
-  std::unique_ptr<SharedMemoryRegion> readRegion_;   // Peer writes, we read
+  std::unique_ptr<MemoryRegion> writeRegion_;  // We write, peer reads
+  std::unique_ptr<MemoryRegion> readRegion_;   // Peer writes, we read
 
   // GQM notification interface
   std::shared_ptr<GqmInterface> gqmInterface_;
 
   // Configuration
   Config config_;
+
+  // Writer-local cursor (only the writer advances it)
+  uint64_t writeCursor_{0};
 
   // Read callback
   ReadCallback* readCallback_{nullptr};

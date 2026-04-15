@@ -24,6 +24,8 @@
 #include <folly/Format.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/Cursor.h>
+#include <folly/io/async/GqmInterface.h>
+#include <folly/io/async/PosixShmProvider.h>
 #include <folly/logging/xlog.h>
 
 namespace folly {
@@ -91,8 +93,8 @@ bool deserializeHandshakeInfo(
 
 SharedMemoryTransport::SharedMemoryTransport(
     EventBase* evb,
-    std::unique_ptr<SharedMemoryRegion> writeRegion,
-    std::unique_ptr<SharedMemoryRegion> readRegion,
+    std::unique_ptr<MemoryRegion> writeRegion,
+    std::unique_ptr<MemoryRegion> readRegion,
     std::shared_ptr<GqmInterface> gqmInterface,
     const Config& config)
     : AsyncTimeout(evb),
@@ -129,8 +131,8 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::createServer(
 
 SharedMemoryTransport::UniquePtr SharedMemoryTransport::createFromRegions(
     EventBase* evb,
-    std::unique_ptr<SharedMemoryRegion> writeRegion,
-    std::unique_ptr<SharedMemoryRegion> readRegion,
+    std::unique_ptr<MemoryRegion> writeRegion,
+    std::unique_ptr<MemoryRegion> readRegion,
     std::shared_ptr<GqmInterface> gqmInterface,
     const Config& config) {
   if (!writeRegion || !readRegion) {
@@ -160,8 +162,10 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
   }
 
   // Generate unique ID for shared memory regions
-  // Use timestamp + random value for uniqueness
-  uint64_t uniqueId = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  uint64_t uniqueId = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+
+  PosixShmProvider provider;
 
   // Create handshake info
   SharedMemoryHandshakeInfo myInfo;
@@ -170,7 +174,6 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
 
   // Send our handshake info
   auto sendBuf = serializeHandshakeInfo(myInfo);
-  bool sendSuccess = false;
 
   auto writeCallback = [&]() -> AsyncTransport::WriteCallback* {
     class SyncWriteCallback : public AsyncTransport::WriteCallback {
@@ -185,13 +188,7 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
     return new SyncWriteCallback();
   }();
 
-  // Use synchronous write for simplicity in handshake
-  // In production, you might want async with timeout
   tcpSocket->writeChain(writeCallback, std::move(sendBuf));
-
-  // Wait for write to complete (simplified - should use proper async)
-  // For now, we'll use a simple polling approach
-  // TODO: Implement proper async handshake with timeout
 
   // Read peer's handshake info
   SharedMemoryHandshakeInfo peerInfo;
@@ -211,7 +208,6 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
 
     void readDataAvailable(size_t len) noexcept override {
       queue_.postallocate(len);
-      // We'll check if we have enough data in the main code
     }
 
     void readEOF() noexcept override { done_ = true; }
@@ -226,11 +222,9 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
     bool& done_;
   };
 
-  HandshakeReadCallback readCallback(readQueue, readDone);
-  tcpSocket->setReadCB(&readCallback);
+  HandshakeReadCallback readCb(readQueue, readDone);
+  tcpSocket->setReadCB(&readCb);
 
-  // Wait for handshake data (simplified polling)
-  // In production, this should be done asynchronously
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (readQueue.chainLength() < kHandshakeHeaderSize + 256 &&
          std::chrono::steady_clock::now() < deadline) {
@@ -245,21 +239,17 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
     throw std::runtime_error("Failed to parse peer handshake info");
   }
 
-  // Create shared memory regions
-  // My write region (peer reads from this)
-  auto writeRegion = SharedMemoryRegion::create(
-      myInfo.writeShmName, config.dataRegionSize, true);
-
-  // My read region (peer writes to this, I read from it)
-  // The peer told us the name in their handshake
-  auto readRegion = SharedMemoryRegion::create(
-      peerInfo.writeShmName, peerInfo.dataRegionSize, false);
+  // Create shared memory regions via PosixShmProvider
+  auto writeRegion = provider.create(
+      myInfo.writeShmName, config.dataRegionSize);
+  auto readRegion = provider.import(
+      peerInfo.writeShmName, peerInfo.dataRegionSize);
 
   // Close TCP socket - handshake complete
   tcpSocket->close();
 
   // Create the transport
-  auto gqmInterface = std::make_shared<DefaultGqmInterface>();
+  auto gqmInterface = std::make_shared<NullGqmInterface>();
   return createFromRegions(
       evb,
       std::move(writeRegion),
@@ -274,10 +264,8 @@ void SharedMemoryTransport::setReadCB(ReadCallback* callback) {
   readCallback_ = callback;
 
   if (callback && state_ == State::CONNECTED) {
-    // Deliver any pending data immediately
     deliverReadData();
 
-    // Schedule polling
     if (!isScheduled()) {
       scheduleTimeout(kDefaultPollInterval);
     }
@@ -328,51 +316,43 @@ void SharedMemoryTransport::writeInternal(
     WriteCallback* callback,
     std::unique_ptr<IOBuf> buf,
     WriteFlags /*flags*/) {
-  if (!writeRegion_ || writeRegion_->isClosed()) {
+  if (!writeRegion_) {
     if (callback) {
       callback->writeErr(
           0,
           AsyncSocketException(
               AsyncSocketException::END_OF_FILE,
-              "Write region closed"));
+              "Write region unavailable"));
     }
     return;
   }
 
-  // Flatten the buffer chain for writing
+  size_t regionSize = writeRegion_->size();
+  char* regionBase = static_cast<char*>(writeRegion_->data());
   size_t totalBytes = buf->computeChainDataLength();
   size_t bytesWritten = 0;
 
   for (auto& iov : *buf) {
-    ssize_t written = writeRegion_->write(iov.data(), iov.size());
-    if (written < 0) {
-      if (callback) {
-        callback->writeErr(
-            bytesWritten,
-            AsyncSocketException(
-                AsyncSocketException::UNKNOWN,
-                "Write failed"));
+    size_t remaining = iov.size();
+    size_t srcOffset = 0;
+    while (remaining > 0) {
+      size_t writePos = (writeCursor_ + bytesWritten + srcOffset) % regionSize;
+      size_t firstPart = std::min(remaining, regionSize - writePos);
+      std::memcpy(regionBase + writePos,
+                   iov.data() + srcOffset, firstPart);
+      if (firstPart < remaining) {
+        std::memcpy(regionBase, iov.data() + srcOffset + firstPart,
+                     remaining - firstPart);
       }
-      state_ = State::ERROR;
-      return;
-    }
-    bytesWritten += written;
-
-    if (static_cast<size_t>(written) < iov.size()) {
-      // Partial write - buffer full
-      // In a real implementation, we'd buffer the rest and retry
-      XLOG(DBG) << "Partial write: " << written << "/" << iov.size();
-      break;
+      bytesWritten += remaining;
+      srcOffset += remaining;
+      remaining = 0;
     }
   }
 
+  writeCursor_ += bytesWritten;
   bytesWritten_ += bytesWritten;
   writeCount_++;
-
-  // Send notification to peer
-  uint64_t writeOffset = writeRegion_->header()->writeOffset.load(std::memory_order_acquire);
-  uint32_t offsetInRegion = static_cast<uint32_t>(writeOffset % writeRegion_->dataSize());
-  sendNotification(offsetInRegion - bytesWritten, bytesWritten);
 
   if (callback) {
     callback->writeSuccess();
@@ -391,16 +371,6 @@ void SharedMemoryTransport::sendNotification(uint32_t offset, uint32_t length) {
 void SharedMemoryTransport::close() {
   State expected = State::CONNECTED;
   if (state_.compare_exchange_strong(expected, State::CLOSING)) {
-    // Mark regions as closed
-    if (writeRegion_) {
-      writeRegion_->close();
-    }
-    if (readRegion_) {
-      readRegion_->close();
-    }
-
-    // Will transition to CLOSED after pending writes complete
-    // For now, just close immediately since we don't have pending writes
     closeNow();
   }
 }
@@ -413,15 +383,9 @@ void SharedMemoryTransport::closeNow() {
 
   cancelTimeout();
 
-  // Close shared memory regions
-  if (writeRegion_) {
-    writeRegion_->close();
-  }
-  if (readRegion_) {
-    readRegion_->close();
-  }
+  writeRegion_.reset();
+  readRegion_.reset();
 
-  // Fail any pending writes
   {
     std::lock_guard<std::mutex> lock(writeMutex_);
     for (auto& req : pendingWrites_) {
@@ -436,13 +400,11 @@ void SharedMemoryTransport::closeNow() {
     pendingWrites_.clear();
   }
 
-  // Notify read callback of EOF
   if (readCallback_) {
     readCallback_->readEOF();
     readCallback_ = nullptr;
   }
 
-  // Call close callback
   if (closeCallback_) {
     closeCallback_();
   }
@@ -451,21 +413,11 @@ void SharedMemoryTransport::closeNow() {
 }
 
 void SharedMemoryTransport::closeWithReset() {
-  // Mark error state
-  if (writeRegion_) {
-    writeRegion_->header()->setError();
-  }
-  if (readRegion_) {
-    readRegion_->header()->setError();
-  }
-
   closeNow();
 }
 
 void SharedMemoryTransport::shutdownWrite() {
-  if (writeRegion_) {
-    writeRegion_->close();
-  }
+  writeRegion_.reset();
 }
 
 void SharedMemoryTransport::shutdownWriteNow() {
@@ -478,11 +430,11 @@ bool SharedMemoryTransport::good() const {
 }
 
 bool SharedMemoryTransport::readable() const {
-  return good() && readRegion_ && readRegion_->availableToRead() > 0;
+  return good();
 }
 
 bool SharedMemoryTransport::writable() const {
-  return good() && writeRegion_ && writeRegion_->availableToWrite() > 0;
+  return good() && writeRegion_;
 }
 
 bool SharedMemoryTransport::connecting() const {
@@ -510,7 +462,6 @@ void SharedMemoryTransport::detachEventBase() {
 }
 
 bool SharedMemoryTransport::isDetachable() const {
-  // Can detach if no pending writes
   std::lock_guard<std::mutex> lock(writeMutex_);
   return pendingWrites_.empty() && !isScheduled();
 }
@@ -545,8 +496,6 @@ void SharedMemoryTransport::processNotifications() {
     notificationReceived_++;
     XLOG(DBG) << "Received notification: offset=" << notification->offset
               << ", length=" << notification->length;
-    // The notification tells us there's new data in the read region
-    // We'll read it in deliverReadData()
   }
 }
 
@@ -555,44 +504,27 @@ void SharedMemoryTransport::deliverReadData() {
     return;
   }
 
-  while (size_t available = readRegion_->availableToRead()) {
-    // Get buffer from callback
+  // Deliver any queued data
+  if (readBufQueue_.chainLength() > 0) {
     void* buf = nullptr;
     size_t bufLen = 0;
     readCallback_->getReadBuffer(&buf, &bufLen);
 
     if (!buf || bufLen == 0) {
-      // Callback returned invalid buffer
-      readCallback_->readErr(
-          AsyncSocketException(
-              AsyncSocketException::INVALID_STATE,
-              "Invalid read buffer"));
+      readCallback_->readErr(AsyncSocketException(
+          AsyncSocketException::INVALID_STATE, "Invalid read buffer"));
       return;
     }
 
-    // Read from shared memory
-    size_t toRead = std::min(available, bufLen);
-    ssize_t bytesRead = readRegion_->read(buf, toRead);
+    auto data = readBufQueue_.split(
+        std::min(bufLen, readBufQueue_.chainLength()));
+    size_t dataLen = data->computeChainDataLength();
+    std::memcpy(buf, data->data(), dataLen);
 
-    if (bytesRead < 0) {
-      readCallback_->readErr(
-          AsyncSocketException(
-              AsyncSocketException::UNKNOWN,
-              "Read failed"));
-      return;
-    }
-
-    if (bytesRead == 0) {
-      // EOF
-      readCallback_->readEOF();
-      return;
-    }
-
-    bytesRead_ += bytesRead;
+    bytesRead_ += dataLen;
     readCount_++;
 
-    // Deliver to callback
-    readCallback_->readDataAvailable(bytesRead);
+    readCallback_->readDataAvailable(dataLen);
   }
 }
 
@@ -601,11 +533,9 @@ void SharedMemoryTransport::timeoutExpired() noexcept {
     return;
   }
 
-  // Check for new data
   processNotifications();
   deliverReadData();
 
-  // Reschedule
   scheduleTimeout(kDefaultPollInterval);
 }
 
