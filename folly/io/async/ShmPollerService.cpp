@@ -85,7 +85,7 @@ void ShmPollerService::initFromProvider(
     const std::string& readPool,
     bool isGqmCreator) {
   initDirection(writeCtx_, provider, writePool, isGqmCreator);
-  initDirection(readCtx_, provider, readPool, !isGqmCreator);
+  initDirection(readCtx_, provider, readPool, isGqmCreator);
 
   // Cross-link readCursors so each cursor is NC-written by one side only.
   //
