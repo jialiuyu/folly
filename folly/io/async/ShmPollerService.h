@@ -20,7 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -182,7 +182,7 @@ class ShmPollerService {
     BusyPollSharedMemoryTransport* transport{nullptr};
     EventBase* evb{nullptr};
   };
-  std::mutex connMu_;
+  mutable std::shared_mutex connMu_;
   std::unordered_map<uint16_t, ConnEntry> connTable_;
   std::atomic<uint16_t> nextConnId_{1};
 };

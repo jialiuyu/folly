@@ -164,7 +164,7 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
     ctx.readCursor->store(localReadCursor, std::memory_order_release);
 
     {
-      std::lock_guard<std::mutex> lk(connMu_);
+      std::shared_lock lk(connMu_);
       auto it = connTable_.find(connId);
       if (it == connTable_.end()) {
         XLOG(DBG5) << "ShmPollerService: dropping data for unknown connId="
@@ -191,13 +191,13 @@ void ShmPollerService::registerTransport(
     uint16_t connId,
     BusyPollSharedMemoryTransport* transport,
     EventBase* evb) {
-  std::lock_guard<std::mutex> lk(connMu_);
+  std::unique_lock lk(connMu_);
   connTable_[connId] = ConnEntry{transport, evb};
   XLOG(INFO) << "ShmPollerService: registered connId=" << connId;
 }
 
 void ShmPollerService::unregisterTransport(uint16_t connId) {
-  std::lock_guard<std::mutex> lk(connMu_);
+  std::unique_lock lk(connMu_);
   connTable_.erase(connId);
   XLOG(INFO) << "ShmPollerService: unregistered connId=" << connId;
 }

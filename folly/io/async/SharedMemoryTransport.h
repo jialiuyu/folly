@@ -308,7 +308,6 @@ class SharedMemoryTransport
 
   // Read state
   IOBufQueue readBufQueue_;
-  std::mutex readMutex_;
 
   // Handshake state
   AsyncTransport::UniquePtr handshakeSocket_;
