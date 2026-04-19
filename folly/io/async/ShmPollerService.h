@@ -272,7 +272,7 @@ class ShmPollerService {
     }
   };
 
-  static void iobufPoolDeleter(void* buf, size_t /*size*/, void* ctx) {
+  static void iobufPoolDeleter(void* buf, void* ctx) {
     static_cast<IOBufPool*>(ctx)->push(buf);
   }
 
