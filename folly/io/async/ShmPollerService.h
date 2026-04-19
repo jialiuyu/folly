@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -163,6 +164,47 @@ class ShmPollerService {
   DirectionContext& readContext() { return readCtx_; }
   const DirectionContext& readContext() const { return readCtx_; }
 
+  // ========== Diagnostics ==========
+
+  struct DiagStats {
+    // Dispatch latency: time from GQM pop to IO-thread lambda execution
+    std::atomic<uint64_t> dispatchCount{0};
+    std::atomic<uint64_t> dispatchSumNs{0};
+    // Power-of-2 histogram: bucket i covers [2^(i+8), 2^(i+9)) ns
+    static constexpr int kDispatchBucketOffset = 9;
+    static constexpr int kDispatchNumBuckets = 20;
+    std::atomic<uint64_t> dispatchBuckets_[kDispatchNumBuckets]{};
+
+    // GQM pop idle: how many empty-pops per successful pop
+    std::atomic<uint64_t> popSuccessCount{0};
+    std::atomic<uint64_t> popEmptyCount{0};
+    std::atomic<uint64_t> popYieldCount{0};
+
+    // Write path
+    std::atomic<uint64_t> writeCallCount{0};
+    std::atomic<uint64_t> writeSumNs{0};
+    std::atomic<uint64_t> writeFlowControlYields{0};
+
+    // Per-message overhead
+    std::atomic<uint64_t> sharedLockCount{0};
+    std::atomic<uint64_t> ioBufAllocCount{0};
+
+    void recordDispatchLatency(uint64_t ns) {
+      dispatchCount.fetch_add(1, std::memory_order_relaxed);
+      dispatchSumNs.fetch_add(ns, std::memory_order_relaxed);
+      int idx = 0;
+      if (ns >= (1ULL << kDispatchBucketOffset)) {
+        idx = 63 - __builtin_clzll(ns) - kDispatchBucketOffset + 1;
+        if (idx < 0) idx = 0;
+        if (idx >= kDispatchNumBuckets) idx = kDispatchNumBuckets - 1;
+      }
+      dispatchBuckets_[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  DiagStats& diagStats() { return diagStats_; }
+  const DiagStats& diagStats() const { return diagStats_; }
+
  private:
   static constexpr uint32_t kMaxSpinCount = 1024;
   static constexpr uint32_t kYieldCount = 64;
@@ -185,6 +227,8 @@ class ShmPollerService {
   mutable std::shared_mutex connMu_;
   std::unordered_map<uint16_t, ConnEntry> connTable_;
   std::atomic<uint16_t> nextConnId_{1};
+
+  DiagStats diagStats_;
 };
 
 } // namespace folly

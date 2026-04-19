@@ -135,18 +135,25 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
   while (ctx.running.load(std::memory_order_acquire)) {
     auto notif = ctx.gqm->pop();
     if (!notif.has_value()) {
+      diagStats_.popEmptyCount.fetch_add(1, std::memory_order_relaxed);
       if (++idleSpins > kMaxSpinCount) {
+        diagStats_.popYieldCount.fetch_add(1, std::memory_order_relaxed);
         sched_yield();
         idleSpins = 0;
       }
       continue;
     }
+    diagStats_.popSuccessCount.fetch_add(1, std::memory_order_relaxed);
     idleSpins = 0;
+
+    // Capture timestamp immediately after successful pop
+    auto popTime = std::chrono::steady_clock::now();
 
     uint16_t connId = notif->connId;
     uint32_t offset = notif->offset;
     uint16_t length = notif->length;
 
+    diagStats_.ioBufAllocCount.fetch_add(1, std::memory_order_relaxed);
     auto chunk = IOBuf::create(std::max(size_t(1), static_cast<size_t>(length)));
     size_t firstPart = std::min(
         static_cast<size_t>(length),
@@ -164,6 +171,7 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
     ctx.readCursor->store(localReadCursor, std::memory_order_release);
 
     {
+      diagStats_.sharedLockCount.fetch_add(1, std::memory_order_relaxed);
       std::shared_lock lk(connMu_);
       auto it = connTable_.find(connId);
       if (it == connTable_.end()) {
@@ -174,7 +182,11 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
       auto* transport = it->second.transport;
       auto* evb = it->second.evb;
       evb->runInEventBaseThread(
-          [transport, data = std::move(chunk)]() mutable {
+          [transport, data = std::move(chunk), popTime, this]() mutable {
+            auto dispatchTime = std::chrono::steady_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                dispatchTime - popTime).count();
+            diagStats_.recordDispatchLatency(static_cast<uint64_t>(ns));
             transport->onDataReceived(std::move(data));
           });
     }
@@ -206,6 +218,8 @@ void ShmPollerService::unregisterTransport(uint16_t connId) {
 
 void ShmPollerService::writeData(
     uint16_t connId, const void* data, size_t len) {
+  auto writeStart = std::chrono::steady_clock::now();
+
   auto& ctx = writeCtx_;
   const auto* src = static_cast<const uint8_t*>(data);
   size_t remaining = len;
@@ -224,6 +238,8 @@ void ShmPollerService::writeData(
         break;
       }
       if (++spins > kMaxSpinCount) {
+        diagStats_.writeFlowControlYields.fetch_add(
+            1, std::memory_order_relaxed);
         sched_yield();
         spins = 0;
       }
@@ -231,6 +247,20 @@ void ShmPollerService::writeData(
 
     uint64_t cursor = ctx.writeCursor->fetch_add(
         chunkLen, std::memory_order_relaxed);
+
+    // Post-reservation check: ensure our reserved range [cursor, cursor+chunkLen)
+    // does not overlap unread data.  The pre-check above is an optimization;
+    // this post-check is the correctness gate for concurrent writers.
+    spins = 0;
+    while (cursor + chunkLen >
+           ctx.readCursor->load(std::memory_order_acquire) + ctx.usableSize) {
+      if (++spins > kMaxSpinCount) {
+        diagStats_.writeFlowControlYields.fetch_add(
+            1, std::memory_order_relaxed);
+        sched_yield();
+        spins = 0;
+      }
+    }
     uint32_t offset = static_cast<uint32_t>(cursor % ctx.usableSize);
 
     size_t firstPart = std::min(
@@ -241,11 +271,29 @@ void ShmPollerService::writeData(
       std::memcpy(ctx.ringBase, src + firstPart, chunkLen - firstPart);
     }
 
+    // Release fence: ensure data-region stores (memcpy above) are globally
+    // visible before the GQM push notification reaches the reader.
+    //
+    // Without this fence, the CPU (ARM) or compiler (LTO) may reorder the
+    // data writes past the GQM head advancement, causing the reader to pop
+    // a valid GQM entry but observe stale data in the ring buffer.
+    //
+    // On x86 (TSO) this fence compiles to nothing; on ARM it emits dmb ish.
+    // The fence pairs with the acquire load in ugqm_pop -> pollerLoop.
+    std::atomic_thread_fence(std::memory_order_release);
+
     ctx.gqm->push(GqmNotification{connId, offset, chunkLen});
 
     src += chunkLen;
     remaining -= chunkLen;
   }
+
+  auto writeEnd = std::chrono::steady_clock::now();
+  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      writeEnd - writeStart).count();
+  diagStats_.writeCallCount.fetch_add(1, std::memory_order_relaxed);
+  diagStats_.writeSumNs.fetch_add(static_cast<uint64_t>(ns),
+                                   std::memory_order_relaxed);
 }
 
 } // namespace folly
