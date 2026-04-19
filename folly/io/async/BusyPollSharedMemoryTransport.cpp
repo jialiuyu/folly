@@ -478,6 +478,11 @@ void BusyPollSharedMemoryTransport::closeNow() {
   }
 
   if (pollerService_ && localConnId_ > 0) {
+    // Invariant: shared-mode transports must be destroyed on their own
+    // EventBase thread so that poller-dispatched lambdas (which re-lookup
+    // transport via connTable on this EventBase) are serialised with
+    // unregisterTransport().
+    DCHECK(!evb_ || evb_->isInEventBaseThread());
     pollerService_->unregisterTransport(localConnId_);
   }
 

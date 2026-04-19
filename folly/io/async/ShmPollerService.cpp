@@ -26,6 +26,13 @@
 
 #include <sched.h>
 
+// Conditional diag-statistics: zero overhead in release builds.
+#if FOLLY_SHM_DIAG_STATS
+#define SHM_STAT(expr) expr
+#else
+#define SHM_STAT(expr) ((void)0)
+#endif
+
 namespace folly {
 
 // ========== Lifecycle ==========
@@ -135,43 +142,58 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
   while (ctx.running.load(std::memory_order_acquire)) {
     auto notif = ctx.gqm->pop();
     if (!notif.has_value()) {
-      diagStats_.popEmptyCount.fetch_add(1, std::memory_order_relaxed);
+      SHM_STAT(diagStats_.popEmptyCount.fetch_add(1, std::memory_order_relaxed));
       if (++idleSpins > kMaxSpinCount) {
-        diagStats_.popYieldCount.fetch_add(1, std::memory_order_relaxed);
+        SHM_STAT(diagStats_.popYieldCount.fetch_add(1, std::memory_order_relaxed));
         sched_yield();
         idleSpins = 0;
       }
       continue;
     }
-    diagStats_.popSuccessCount.fetch_add(1, std::memory_order_relaxed);
+    SHM_STAT(diagStats_.popSuccessCount.fetch_add(1, std::memory_order_relaxed));
     idleSpins = 0;
 
-    // Capture timestamp immediately after successful pop
-    auto popTime = std::chrono::steady_clock::now();
+    // Capture timestamp immediately after successful pop (only for stats)
+    [[maybe_unused]] auto popTime = std::chrono::steady_clock::now();
 
     uint16_t connId = notif->connId;
     uint32_t offset = notif->offset;
     uint16_t length = notif->length;
 
-    diagStats_.ioBufAllocCount.fetch_add(1, std::memory_order_relaxed);
-    auto chunk = IOBuf::create(std::max(size_t(1), static_cast<size_t>(length)));
+    SHM_STAT(diagStats_.ioBufAllocCount.fetch_add(1, std::memory_order_relaxed));
+    // Use pooled buffer to avoid per-chunk malloc/free.
+    // When the Thrift parser releases the IOBuf, the custom deleter
+    // returns the buffer to iobufPool_ for reuse.
+    auto* buf = iobufPool_.alloc();
     size_t firstPart = std::min(
         static_cast<size_t>(length),
         ctx.usableSize - static_cast<size_t>(offset));
-    std::memcpy(chunk->writableData(), ctx.ringBase + offset, firstPart);
+    std::memcpy(buf, ctx.ringBase + offset, firstPart);
     if (firstPart < length) {
       std::memcpy(
-          chunk->writableData() + firstPart,
+          static_cast<uint8_t*>(buf) + firstPart,
           ctx.ringBase,
           length - firstPart);
     }
-    chunk->append(length);
+    auto chunk = IOBuf::takeOwnership(
+        buf, length, iobufPoolDeleter, &iobufPool_);
 
     localReadCursor += length;
     ctx.readCursor->store(localReadCursor, std::memory_order_release);
 
+    // Obtain the target EventBase with a brief shared_lock.  Only connId
+    // (not the raw transport pointer) is captured by the lambda; the
+    // transport is re-looked-up inside the lambda on the EventBase thread.
+    //
+    // This prevents use-after-free: the transport pointer is obtained and
+    // consumed within a single EventBase event-loop turn, which serialises
+    // with closeNow()/unregisterTransport() on the same EventBase.
+    //
+    // Invariant: in shared mode, BusyPollSharedMemoryTransport must only be
+    // destroyed on its own EventBase thread.
+    EventBase* evb = nullptr;
     {
-      diagStats_.sharedLockCount.fetch_add(1, std::memory_order_relaxed);
+      SHM_STAT(diagStats_.sharedLockCount.fetch_add(1, std::memory_order_relaxed));
       std::shared_lock lk(connMu_);
       auto it = connTable_.find(connId);
       if (it == connTable_.end()) {
@@ -179,17 +201,33 @@ void ShmPollerService::pollerLoop(DirectionContext& ctx) {
                     << connId;
         continue;
       }
-      auto* transport = it->second.transport;
-      auto* evb = it->second.evb;
-      evb->runInEventBaseThread(
-          [transport, data = std::move(chunk), popTime, this]() mutable {
+      evb = it->second.evb;
+    }
+    evb->runInEventBaseThread(
+        [connId, data = std::move(chunk), popTime, this]() mutable {
+          SHM_STAT({
             auto dispatchTime = std::chrono::steady_clock::now();
             auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 dispatchTime - popTime).count();
             diagStats_.recordDispatchLatency(static_cast<uint64_t>(ns));
-            transport->onDataReceived(std::move(data));
           });
-    }
+
+          BusyPollSharedMemoryTransport* transport = nullptr;
+          {
+            std::shared_lock lk(connMu_);
+            auto it = connTable_.find(connId);
+            if (it == connTable_.end()) {
+              return; // Transport unregistered — drop data
+            }
+            transport = it->second.transport;
+          }
+          // Lock released before onDataReceived to avoid deadlock if the
+          // read callback triggers close() (reentrant unique_lock).
+          // Safety: EventBase is single-threaded, so no other callback
+          // (including closeNow/unregisterTransport) can interleave between
+          // the lock release and this call.
+          transport->onDataReceived(std::move(data));
+        });
   }
 }
 
@@ -218,7 +256,7 @@ void ShmPollerService::unregisterTransport(uint16_t connId) {
 
 void ShmPollerService::writeData(
     uint16_t connId, const void* data, size_t len) {
-  auto writeStart = std::chrono::steady_clock::now();
+  [[maybe_unused]] auto writeStart = std::chrono::steady_clock::now();
 
   auto& ctx = writeCtx_;
   const auto* src = static_cast<const uint8_t*>(data);
@@ -229,8 +267,9 @@ void ShmPollerService::writeData(
         std::min(remaining,
                  static_cast<size_t>(GqmNotification::kMaxChunkSize)));
 
-    // Flow control: spin until enough free space
+    // Flow control: spin until enough free space (with timeout)
     uint32_t spins = 0;
+    auto flowStart = std::chrono::steady_clock::now();
     for (;;) {
       uint64_t w = ctx.writeCursor->load(std::memory_order_relaxed);
       uint64_t r = ctx.readCursor->load(std::memory_order_acquire);
@@ -238,8 +277,17 @@ void ShmPollerService::writeData(
         break;
       }
       if (++spins > kMaxSpinCount) {
-        diagStats_.writeFlowControlYields.fetch_add(
-            1, std::memory_order_relaxed);
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - flowStart).count();
+        if (elapsed >= kWriteTimeoutMs) {
+          SHM_STAT(diagStats_.writeTimeoutCount.fetch_add(1, std::memory_order_relaxed));
+          throw std::runtime_error(folly::sformat(
+              "ShmPollerService::writeData: flow control timeout after {}ms "
+              "(connId={}, chunkLen={}, usableSize={}, w={}, r={})",
+              elapsed, connId, chunkLen, ctx.usableSize, w, r));
+        }
+        SHM_STAT(diagStats_.writeFlowControlYields.fetch_add(
+            1, std::memory_order_relaxed));
         sched_yield();
         spins = 0;
       }
@@ -252,11 +300,21 @@ void ShmPollerService::writeData(
     // does not overlap unread data.  The pre-check above is an optimization;
     // this post-check is the correctness gate for concurrent writers.
     spins = 0;
+    auto postStart = std::chrono::steady_clock::now();
     while (cursor + chunkLen >
            ctx.readCursor->load(std::memory_order_acquire) + ctx.usableSize) {
       if (++spins > kMaxSpinCount) {
-        diagStats_.writeFlowControlYields.fetch_add(
-            1, std::memory_order_relaxed);
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - postStart).count();
+        if (elapsed >= kWriteTimeoutMs) {
+          SHM_STAT(diagStats_.writeTimeoutCount.fetch_add(1, std::memory_order_relaxed));
+          throw std::runtime_error(folly::sformat(
+              "ShmPollerService::writeData: post-reservation timeout after {}ms "
+              "(connId={}, cursor={}, chunkLen={}, usableSize={})",
+              elapsed, connId, cursor, chunkLen, ctx.usableSize));
+        }
+        SHM_STAT(diagStats_.writeFlowControlYields.fetch_add(
+            1, std::memory_order_relaxed));
         sched_yield();
         spins = 0;
       }
@@ -288,12 +346,14 @@ void ShmPollerService::writeData(
     remaining -= chunkLen;
   }
 
-  auto writeEnd = std::chrono::steady_clock::now();
-  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      writeEnd - writeStart).count();
-  diagStats_.writeCallCount.fetch_add(1, std::memory_order_relaxed);
-  diagStats_.writeSumNs.fetch_add(static_cast<uint64_t>(ns),
-                                   std::memory_order_relaxed);
+  SHM_STAT({
+    auto writeEnd = std::chrono::steady_clock::now();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        writeEnd - writeStart).count();
+    diagStats_.writeCallCount.fetch_add(1, std::memory_order_relaxed);
+    diagStats_.writeSumNs.fetch_add(static_cast<uint64_t>(ns),
+                                     std::memory_order_relaxed);
+  });
 }
 
 } // namespace folly

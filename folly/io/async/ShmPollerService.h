@@ -31,6 +31,9 @@
 #include <folly/io/async/GqmInterface.h>
 #include <folly/io/async/ImportedMemoryProvider.h>
 
+#include <mutex>
+#include <vector>
+
 namespace folly {
 
 class BusyPollSharedMemoryTransport;
@@ -52,6 +55,18 @@ class BusyPollSharedMemoryTransport;
  */
 static constexpr size_t kCursorSlotSize = 64; // one cacheline per cursor
 static constexpr size_t kControlBlockSize = 2 * kCursorSlotSize; // 128 bytes
+
+/**
+ * Set FOLLY_SHM_DIAG_STATS=1 to enable per-iteration diagnostic counters.
+ * Default: enabled in debug builds, disabled in release for zero overhead.
+ */
+#if !defined(FOLLY_SHM_DIAG_STATS)
+#if !defined(NDEBUG)
+#define FOLLY_SHM_DIAG_STATS 1
+#else
+#define FOLLY_SHM_DIAG_STATS 0
+#endif
+#endif
 
 /**
  * ShmPollerService: shared GQM + data ring manager with poller dispatch.
@@ -184,6 +199,7 @@ class ShmPollerService {
     std::atomic<uint64_t> writeCallCount{0};
     std::atomic<uint64_t> writeSumNs{0};
     std::atomic<uint64_t> writeFlowControlYields{0};
+    std::atomic<uint64_t> writeTimeoutCount{0};
 
     // Per-message overhead
     std::atomic<uint64_t> sharedLockCount{0};
@@ -208,6 +224,7 @@ class ShmPollerService {
  private:
   static constexpr uint32_t kMaxSpinCount = 1024;
   static constexpr uint32_t kYieldCount = 64;
+  static constexpr uint32_t kWriteTimeoutMs = 5000; // 5s backpressure timeout
 
   void pollerLoop(DirectionContext& ctx);
 
@@ -216,6 +233,48 @@ class ShmPollerService {
       ImportedMemoryProvider& provider,
       const std::string& poolName,
       bool createGqm);
+
+  // IOBuf buffer pool: reclaims buffers after the Thrift parser releases
+  // them, avoiding per-chunk malloc/free in the poller hot path.
+  // Thread-safe: pop() runs on poller thread, push() on arbitrary IO threads.
+  struct IOBufPool {
+    static constexpr size_t kBufSize = GqmNotification::kMaxChunkSize + 1;
+    static constexpr size_t kPoolCapacity = 128;
+
+    std::mutex mu;
+    std::vector<void*> freeList;
+
+    void* alloc() {
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!freeList.empty()) {
+          void* p = freeList.back();
+          freeList.pop_back();
+          return p;
+        }
+      }
+      return std::malloc(kBufSize);
+    }
+
+    void push(void* p) {
+      std::lock_guard<std::mutex> lk(mu);
+      if (freeList.size() < kPoolCapacity) {
+        freeList.push_back(p);
+      } else {
+        std::free(p);
+      }
+    }
+
+    ~IOBufPool() {
+      for (void* p : freeList) {
+        std::free(p);
+      }
+    }
+  };
+
+  static void iobufPoolDeleter(void* buf, size_t /*size*/, void* ctx) {
+    static_cast<IOBufPool*>(ctx)->push(buf);
+  }
 
   DirectionContext writeCtx_;
   DirectionContext readCtx_;
@@ -228,6 +287,7 @@ class ShmPollerService {
   std::unordered_map<uint16_t, ConnEntry> connTable_;
   std::atomic<uint16_t> nextConnId_{1};
 
+  IOBufPool iobufPool_;
   DiagStats diagStats_;
 };
 
