@@ -1,100 +1,98 @@
-# SHM Reply Head-of-Line Blocking Mitigation Plan
+# SHM 回包队头阻塞缓解方案
 
-## Context
+## 背景
 
-The current shared-memory transport path reuses fbthrift/Rocket's normal
-`AsyncTransport` response model. This keeps socket and SHM behavior compatible,
-but it also means ThreadManager-dispatched RPC replies must return to the IO
-EventBase before the response can be written to SHM.
+当前共享内存传输路径复用了 fbthrift/Rocket 标准的 `AsyncTransport`
+响应模型。这保证了 socket transport 和 SHM transport 的行为兼容，但
+也意味着 ThreadManager 派发的 RPC 回包必须先回到 IO EventBase，之后
+才能真正写入 SHM。
 
-For very small benchmark RPCs such as `download()`, this creates avoidable
-head-of-line blocking:
+对于 `download()` 这类非常小的 benchmark RPC，这会制造可避免的队头
+阻塞：
 
 ```text
 SHM poller
-  -> IO EventBase request delivery and Rocket dispatch
-  -> ThreadManager worker handler
-  -> HandlerCallback reply completion
+  -> IO EventBase 投递请求并做 Rocket dispatch
+  -> ThreadManager worker 执行 handler
+  -> HandlerCallback 完成响应
   -> ReplyQueue
-  -> IO EventBase drains ReplyQueue
+  -> IO EventBase drain ReplyQueue
   -> Rocket send path
   -> BusyPollSharedMemoryTransport::writeChain()
   -> ShmPollerService::writeData()
 ```
 
-The SHM data plane itself does not require fd readiness or epoll-style write
-ownership. The bottleneck exists because the current Rocket connection and
-response-channel control plane are IO EventBase-affine.
+SHM 数据面本身不需要 fd readiness，也不需要 epoll 风格的写事件所有权。
+当前瓶颈来自 Rocket connection 和 response-channel 控制面仍然绑定在
+IO EventBase 上。
 
-## Current Evidence
+## 当前证据
 
-The performance benchmark service currently has two different execution models:
+当前性能 benchmark service 有两种不同的执行模型：
 
-- `sum`, `noop`, and `onewayNoop` are annotated with
-  `@cpp.ProcessInEbThreadUnsafe`.
-- `download`, `upload`, and `streamDownload` are not annotated and therefore use
-  ThreadManager dispatch.
+- `sum`、`noop`、`onewayNoop` 带有 `@cpp.ProcessInEbThreadUnsafe`。
+- `download`、`upload`、`streamDownload` 没有该注解，因此走
+  ThreadManager dispatch。
 
-Generated code reflects this distinction:
+生成代码也体现了这个区别：
 
-- EventBase methods execute inline through `async_eb_*`.
-- ThreadManager methods execute through `processInThread()` and `async_tm_*`.
-- A worker-thread reply that is not already running on the IO EventBase is
-  queued through `HandlerCallbackBase::putMessageInReplyQueue()`.
+- EventBase 方法通过 `async_eb_*` 在线执行。
+- ThreadManager 方法通过 `processInThread()` 和 `async_tm_*` 执行。
+- 如果 worker 线程完成响应时不在 IO EventBase 线程上，响应会通过
+  `HandlerCallbackBase::putMessageInReplyQueue()` 入队。
 
-In shared SHM mode, received bytes are delivered by `ShmPollerService` via
-`EventBase::runInEventBaseThread()`, and response writes eventually reach
-`BusyPollSharedMemoryTransport::writeInternal()`, which delegates to
-`ShmPollerService::writeData()`.
+在 shared SHM 模式下，接收数据由 `ShmPollerService` 通过
+`EventBase::runInEventBaseThread()` 投递，响应写入最终进入
+`BusyPollSharedMemoryTransport::writeInternal()`，再委托给
+`ShmPollerService::writeData()`。
 
-Therefore, a ThreadManager-dispatched SHM RPC still depends on the IO EventBase
-for the final response write.
+因此，一个 ThreadManager 派发的 SHM RPC 仍然依赖 IO EventBase 完成
+最终回包写入。
 
-## Problem Statement
+## 问题定义
 
-For small RPCs, ThreadManager dispatch and ReplyQueue handoff dominate the
-actual handler work. With one IO thread and one SHM lane, the same IO EventBase
-is responsible for:
+对于小 RPC，ThreadManager 调度和 ReplyQueue 回跳的成本会盖过真正的
+handler 工作。在 `--io_threads=1` 和 `--shm_lanes=1` 时，同一个 IO
+EventBase 同时负责：
 
-- inbound SHM delivery callbacks,
-- Rocket frame parsing and dispatch,
-- ReplyQueue draining,
-- Rocket response framing and write batching,
-- outbound SHM writes.
+- inbound SHM delivery callback，
+- Rocket frame 解析和 dispatch，
+- ReplyQueue drain，
+- Rocket response framing 和 write batching，
+- outbound SHM 写入。
 
-If the IO EventBase is busy, worker replies accumulate behind the ReplyQueue
-drain point. This explains low steady-state QPS and very long tail latency for
-`download()` compared with EventBase-only RPCs such as `sum`.
+一旦 IO EventBase 忙碌，worker 已完成的响应会堆在 ReplyQueue drain
+点后面。这解释了 `download()` 相对 `sum` 这类 EventBase-only RPC 的
+低稳态 QPS 和超长尾延迟。
 
-## Goals
+## 目标
 
-1. Restore benchmark `download()` performance for the trivial in-memory response
-   case.
-2. Preserve socket transport behavior.
-3. Preserve legacy SHM behavior unless explicitly opted in.
-4. Provide a path toward a general worker-thread SHM reply optimization without
-   breaking Rocket ordering, lifetime, or backpressure semantics.
+1. 恢复 benchmark `download()` 在简单内存响应场景下的性能。
+2. 保持 socket transport 行为不变。
+3. 除非显式开启，保持 legacy SHM 行为不变。
+4. 为通用 worker-thread SHM 回包优化提供演进路径，同时不破坏 Rocket
+   ordering、lifetime 和 backpressure 语义。
 
-## Non-Goals
+## 非目标
 
-- Do not change public folly APIs for the quick fix.
-- Do not make all RPC handlers run on the IO EventBase.
-- Do not bypass Rocket framing or response metadata.
-- Do not support socket worker-direct writes; this is SHM-specific.
+- 快速修复阶段不修改 folly 公开 API。
+- 不让所有 RPC handler 都跑在 IO EventBase 上。
+- 不绕过 Rocket framing 或 response metadata。
+- 不支持 socket worker-direct write；该优化只针对 SHM。
 
-## Option A: Execute Trivial SHM Benchmark RPCs on the IO EventBase
+## 方案 A：让轻量 SHM Benchmark RPC 在 IO EventBase 上执行
 
-### Summary
+### 摘要
 
-Annotate `download()` with `@cpp.ProcessInEbThreadUnsafe` and implement the
-corresponding `async_eb_download()` handler. This moves the trivial response
-handler onto the IO EventBase, matching the current `sum()` execution model.
+给 `download()` 添加 `@cpp.ProcessInEbThreadUnsafe`，并实现对应的
+`async_eb_download()` handler。这样会把这个极轻量响应 handler 移到
+IO EventBase 上执行，与当前 `sum()` 的执行模型一致。
 
-### Expected Path
+### 预期路径
 
 ```text
 SHM poller
-  -> IO EventBase request delivery and Rocket dispatch
+  -> IO EventBase 投递请求并做 Rocket dispatch
   -> async_eb_download()
   -> HandlerCallback::result()
   -> Rocket send path
@@ -102,18 +100,18 @@ SHM poller
   -> ShmPollerService::writeData()
 ```
 
-This removes the worker hop and ReplyQueue handoff.
+该路径移除了 worker hop 和 ReplyQueue 回跳。
 
-### Implementation Shape
+### 实现形态
 
-In `fbthrift/thrift/perf/cpp2/if/StreamApi.thrift`:
+在 `fbthrift/thrift/perf/cpp2/if/StreamApi.thrift` 中：
 
 ```thrift
 @cpp.ProcessInEbThreadUnsafe
 ApiBase.Chunk2 download();
 ```
 
-In the benchmark handler, add an EventBase handler implementation:
+在 benchmark handler 中增加 EventBase handler 实现：
 
 ```cpp
 void async_eb_download(
@@ -124,53 +122,53 @@ void async_eb_download(
 }
 ```
 
-The exact return object construction should follow the generated signature and
-local code style after regeneration.
+具体返回对象构造方式应以重新生成后的签名和本地代码风格为准。
 
-### Benefits
+### 收益
 
-- Minimal change.
-- Directly validates the root-cause hypothesis.
-- Removes ThreadManager scheduling and ReplyQueue handoff for `download()`.
-- Keeps socket and general worker-dispatched RPC behavior unchanged.
+- 改动最小。
+- 可以直接验证根因假设。
+- 为 `download()` 移除 ThreadManager 调度和 ReplyQueue 回跳。
+- 不影响 socket，也不影响一般 worker-dispatched RPC。
 
-### Risks
+### 风险
 
-- `ProcessInEbThreadUnsafe` disables queue timeout and some overload protection.
-- The handler must remain fast, non-blocking, and lock-light.
-- This is not a general solution for real worker-thread RPCs.
+- `ProcessInEbThreadUnsafe` 会禁用 queue timeout 和部分 overload
+  protection。
+- handler 必须非常快，不能阻塞，不能持有可能阻塞的锁。
+- 这不是面向真实 worker-thread RPC 的通用解法。
 
-### Acceptance Criteria
+### 验收标准
 
-- Generated code routes `download()` through `async_eb_download()`.
-- `download()` no longer calls `processInThread()` in generated code.
-- `download()` QPS approaches the same order of magnitude as `sum()`.
-- P99/P99.9 no longer show second-level tail latency under the benchmark setup.
+- 生成代码将 `download()` 路由到 `async_eb_download()`。
+- 生成代码中 `download()` 不再调用 `processInThread()`。
+- `download()` QPS 接近 `sum()` 的同一数量级。
+- 在相同 benchmark 配置下，P99/P99.9 不再出现秒级长尾。
 
-## Option B: Add a SHM Worker-Direct Reply Fast Path
+## 方案 B：增加 SHM Worker-Direct Reply Fast Path
 
-### Summary
+### 摘要
 
-Add a SHM-specific reply path that allows worker-thread completions to submit
-serialized Rocket response frames to SHM without first waiting for the IO
-EventBase to drain ReplyQueue.
+增加一个 SHM 专用回包路径，使 worker 线程完成响应后，可以把已经序列化
+好的 Rocket response frame 提交到 SHM，而不是先等待 IO EventBase drain
+ReplyQueue。
 
-This is the general fix, but it touches stricter invariants than Option A.
+这是通用修复方向，但它触及的语义约束比方案 A 更严格。
 
-### Key Invariants
+### 关键不变量
 
-Any direct worker reply path must preserve:
+任何 worker-direct reply 路径都必须保持：
 
-- per-connection byte ordering,
-- Rocket stream response ordering,
-- write callback and error semantics,
-- connection close and unregister lifetime safety,
-- backpressure behavior when the SHM ring is full,
-- compatibility with non-SHM transports.
+- 单 connection 内的字节流顺序，
+- Rocket stream response ordering，
+- write callback 和错误语义，
+- connection close / unregister 的生命周期安全，
+- SHM ring 满时的 backpressure 行为，
+- 与非 SHM transport 的兼容性。
 
-### Proposed Architecture
+### 建议架构
 
-Introduce a SHM-only reply writer owned by the shared-mode Rocket connection:
+为 shared-mode Rocket connection 引入一个只用于 SHM 的 reply writer：
 
 ```text
 worker thread
@@ -180,21 +178,22 @@ worker thread
   -> ShmPollerService::writeData()
 ```
 
-The writer should be exposed only when the underlying transport is shared-mode
-`BusyPollSharedMemoryTransport`.
+这个 writer 只应在底层 transport 是 shared-mode
+`BusyPollSharedMemoryTransport` 时暴露。
 
-A transport capability check is preferable to special-casing generic transports:
+相比在通用 transport 中硬编码特殊逻辑，更推荐增加 transport capability
+检查：
 
 ```cpp
 bool supportsThreadSafeShmDirectReply() const;
 ```
 
-The default implementation is false. Shared-mode SHM can opt in once ordering
-and lifetime rules are satisfied.
+默认实现返回 false。shared-mode SHM 在满足 ordering 和 lifetime 规则后
+可以 opt in。
 
-### Phase B1: Experimental Direct Writer
+### 阶段 B1：实验性 Direct Writer
 
-Use a per-connection mutex to protect complete response-frame writes:
+使用 per-connection mutex 保护完整 response-frame 写入：
 
 ```text
 worker
@@ -204,22 +203,22 @@ worker
   -> unlock
 ```
 
-Properties:
+性质：
 
-- Easy to reason about.
-- Prevents frame interleaving between workers.
-- Keeps direct-write scope narrow.
+- 容易推理。
+- 防止多个 worker 的 frame 片段互相穿插。
+- direct-write 范围较窄。
 
-Limitations:
+限制：
 
-- A worker may block or spin under SHM flow control.
-- Mutex contention can reduce gains for many simultaneous responses.
-- Error handling and close races must be carefully guarded.
+- SHM flow control 时 worker 可能阻塞或 spin。
+- 多个响应同时写同一 connection 时，mutex 竞争会降低收益。
+- 错误处理和 close race 必须严格防护。
 
-### Phase B2: Per-Connection SHM Reply Queue
+### 阶段 B2：Per-Connection SHM Reply Queue
 
-Replace worker-side direct spinning with a per-connection MPSC queue and a
-non-IO writer/drainer:
+将 worker 侧直接 spin 改成 per-connection MPSC queue，并由非 IO writer /
+drainer 负责写 SHM：
 
 ```text
 worker
@@ -231,82 +230,80 @@ SHM reply drainer
   -> ShmPollerService::writeData()
 ```
 
-Properties:
+性质：
 
-- Preserves response order without holding worker threads in SHM flow control.
-- Makes backpressure explicit.
-- Avoids depending on the IO EventBase for reply draining.
+- 在不让 worker 卡在 SHM flow control 的前提下保持响应顺序。
+- backpressure 更显式。
+- 回包 drain 不依赖 IO EventBase。
 
-Limitations:
+限制：
 
-- More infrastructure.
-- Needs shutdown coordination with connection close.
-- Needs metrics and bounded queue policy.
+- 基础设施更多。
+- 需要与 connection close 做关闭协调。
+- 需要 metrics 和有界队列策略。
 
-### Fallback Rules
+### Fallback 规则
 
-The direct path should fall back to the existing ReplyQueue path when:
+以下情况应回退到现有 ReplyQueue 路径：
 
-- the transport is not shared-mode SHM,
-- the response carries FDs or socket-only features,
-- the connection is closing,
-- direct writer backpressure exceeds a bounded threshold,
-- ordering state is uncertain,
-- any feature flag disables the optimization.
+- transport 不是 shared-mode SHM，
+- 响应携带 FD 或依赖 socket-only feature，
+- connection 正在关闭，
+- direct writer backpressure 超过有界阈值，
+- ordering 状态不确定，
+- feature flag 禁用该优化。
 
-### Required Metrics
+### 必要指标
 
-Add counters for:
+增加以下 counters：
 
-- direct reply attempts,
-- direct reply successes,
-- direct reply fallbacks,
-- direct reply write failures,
-- SHM write flow-control yields,
-- direct reply queue depth,
-- ReplyQueue enqueue/drain counts,
-- IO EventBase notification queue size if available.
+- direct reply attempts，
+- direct reply successes，
+- direct reply fallbacks，
+- direct reply write failures，
+- SHM write flow-control yields，
+- direct reply queue depth，
+- ReplyQueue enqueue / drain counts，
+- IO EventBase notification queue size，如果可获取。
 
-## Recommended Rollout
+## 推荐推进顺序
 
-### Step 1: Implement Option A
+### 第 1 步：先实现方案 A
 
-Use the EventBase-handler approach for `download()` only. This is the fastest
-way to validate the diagnosis and recover benchmark performance for trivial
-payload responses.
+只对 `download()` 使用 EventBase-handler 路径。这是验证诊断并恢复轻量
+payload response benchmark 性能的最快方式。
 
-### Step 2: Add Diagnostics
+### 第 2 步：补充诊断指标
 
-Before implementing Option B, add enough observability to prove where time is
-spent:
+实现方案 B 前，先增加足够可观测性来证明耗时位置：
 
-- count worker replies that enter ReplyQueue,
-- measure ReplyQueue wait time before IO EventBase drain,
-- measure SHM write latency and flow-control yields,
-- measure poller-to-EventBase dispatch latency.
+- 统计进入 ReplyQueue 的 worker replies，
+- 测量 IO EventBase drain 前的 ReplyQueue 等待时间，
+- 测量 SHM write latency 和 flow-control yields，
+- 测量 poller 到 EventBase 的 dispatch latency。
 
-### Step 3: Prototype Option B Behind a Feature Flag
+### 第 3 步：在 Feature Flag 后面原型化方案 B
 
-Implement worker-direct SHM reply for simple request-response payloads only.
-Keep socket, legacy SHM, streaming, sink, bidi, FD-carrying responses, and
-complex error paths on the existing response path.
+只为简单 request-response payload 实现 worker-direct SHM reply。socket、
+legacy SHM、streaming、sink、bidi、携带 FD 的响应和复杂错误路径继续走
+现有 response path。
 
-### Step 4: Expand Only After Invariant Tests Pass
+### 第 4 步：不变量测试通过后再扩展
 
-Do not generalize the direct path until it passes ordering, close-race,
-backpressure, multi-client, and mixed-RPC tests.
+只有通过 ordering、close-race、backpressure、multi-client 和 mixed-RPC
+测试后，才能扩大 direct path 覆盖范围。
 
-## Test Plan
+## 测试计划
 
-### Static Verification
+### 静态验证
 
-- Confirm generated `download()` code uses `async_eb_download()`.
-- Confirm generated `download()` setup no longer invokes `processInThread()`.
-- Confirm `sum()` and `download()` have matching executor metadata.
+- 确认生成的 `download()` 代码使用 `async_eb_download()`。
+- 确认生成的 `download()` setup 不再调用 `processInThread()`。
+- 确认 `sum()` 和 `download()` 具有一致的 executor metadata。
 
-### Benchmark Verification
+### Benchmark 验证
 
-Run the same benchmark configuration before and after Option A:
+在方案 A 前后运行同一组 benchmark 配置：
 
 ```text
 --transport=shm
@@ -317,43 +314,42 @@ Run the same benchmark configuration before and after Option A:
 --shm_lanes=1
 ```
 
-Expected:
+预期：
 
-- large QPS increase versus current worker-dispatched `download()`,
-- no alternating server-side 0/100 QPS pattern,
-- P99 and P99.9 no longer at second-level latency.
+- 相比当前 worker-dispatched `download()`，QPS 显著提升，
+- server 侧不再出现明显的 0/100 QPS 交替模式，
+- P99 和 P99.9 不再是秒级延迟。
 
-### Regression Verification
+### 回归验证
 
-- Socket transport benchmark still works.
-- Shared SHM benchmark still works for `sum`, `noop`, `upload`, and
-  `streamDownload`.
-- Legacy SHM fallback path is unchanged.
-- Multi-client tests preserve response correctness.
+- socket transport benchmark 仍然正常。
+- shared SHM benchmark 中 `sum`、`noop`、`upload`、`streamDownload` 仍然正常。
+- legacy SHM fallback path 不变。
+- multi-client 测试保持响应正确性。
 
-### Option B Specific Tests
+### 方案 B 专项测试
 
-- Multiple workers replying on the same connection preserve frame order.
-- Connection close during pending direct replies does not use freed state.
-- SHM ring full condition does not spin forever on CPU workers.
-- Direct path falls back correctly when disabled or unsupported.
+- 同一 connection 上多个 worker 同时回包时 frame 顺序保持正确。
+- pending direct replies 期间 connection close 不访问已释放状态。
+- SHM ring 满时不会让 CPU worker 无限 spin。
+- direct path 在禁用或不支持时正确 fallback。
 
-## Open Questions
+## 开放问题
 
-1. Should direct SHM replies be implemented below Rocket as an
-   `AsyncTransport` capability, or above Rocket as a Rocket connection feature?
-2. Should Phase B1 allow worker threads to block on SHM flow control, or should
-   it immediately enqueue to a drainer?
-3. What is the acceptable fallback threshold before returning to the existing
-   IO EventBase ReplyQueue path?
-4. Which Rocket response variants are safe for the first direct-path prototype:
-   simple request-response only, or also exceptions?
+1. Direct SHM replies 应该做在 Rocket 下面作为 `AsyncTransport` capability，
+   还是做在 Rocket connection 层？
+2. 阶段 B1 是否允许 worker 线程阻塞在 SHM flow control 上，还是应该立即
+   enqueue 到 drainer？
+3. 回退到现有 IO EventBase ReplyQueue 路径前，direct writer 的可接受
+   backpressure 阈值是多少？
+4. 第一个 direct-path 原型应支持哪些 Rocket response 变体：只支持普通
+   request-response，还是也支持 exception？
 
-## Recommendation
+## 建议
 
-Implement Option A first for the benchmark `download()` RPC. It is the smallest
-change and directly addresses the current performance cliff.
+先为 benchmark `download()` RPC 实现方案 A。这是最小改动，并且直接解决
+当前性能断崖。
 
-Treat Option B as a separate transport/Rocket design effort. SHM can support a
-worker-direct data path, but the implementation must explicitly preserve
-Rocket's connection ordering, lifetime, and backpressure semantics.
+将方案 B 作为独立的 transport/Rocket 设计工作推进。SHM 可以支持
+worker-direct 数据路径，但实现必须显式保持 Rocket 的 connection ordering、
+lifetime 和 backpressure 语义。
