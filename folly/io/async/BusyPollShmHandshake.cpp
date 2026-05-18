@@ -225,7 +225,7 @@ bool readFramedHandshake(
     EventBase* evb,
     AsyncTransport* sock,
     ShmHandshakeInfo& info) {
-  IOBufQueue readQueue;
+  IOBufQueue readQueue(IOBufQueue::cacheChainLength());
 
   if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
     XLOG(ERR) << "Failed to read handshake frame header";
@@ -464,17 +464,18 @@ namespace {
 
 constexpr uint32_t kSharedHandshakeMagic = 0x53484D53; // "SHMS"
 
-std::unique_ptr<IOBuf> serializeConnId(uint16_t connId) {
+std::unique_ptr<IOBuf> serializeConnId(uint16_t connId, uint8_t laneId) {
   auto buf = IOBuf::create(kFrameHeaderSize + 8);
   io::Appender appender(buf.get(), 0);
   appender.writeBE<uint32_t>(8);
   appender.writeBE<uint32_t>(kSharedHandshakeMagic);
   appender.writeBE<uint16_t>(connId);
-  appender.writeBE<uint16_t>(0); // reserved
+  appender.writeBE<uint8_t>(laneId);
+  appender.writeBE<uint8_t>(0); // reserved
   return buf;
 }
 
-bool deserializeConnId(const IOBuf* buf, uint16_t& connId) {
+bool deserializeConnId(const IOBuf* buf, uint16_t& connId, uint8_t& laneId) {
   io::Cursor cursor(buf);
   auto magic = cursor.readBE<uint32_t>();
   if (magic != kSharedHandshakeMagic) {
@@ -482,6 +483,7 @@ bool deserializeConnId(const IOBuf* buf, uint16_t& connId) {
     return false;
   }
   connId = cursor.readBE<uint16_t>();
+  laneId = cursor.readBE<uint8_t>();
   return true;
 }
 
@@ -490,14 +492,17 @@ bool deserializeConnId(const IOBuf* buf, uint16_t& connId) {
 ShmSharedHandshakeResult shmHandshakeClientShared(
     EventBase* evb,
     AsyncTransport* sock,
-    uint16_t localConnId) {
-  auto sendBuf = serializeConnId(localConnId);
+    uint16_t localConnId,
+    uint8_t laneId) {
+  fprintf(stderr, "DEBUG: shmHandshakeClientShared called, connId=%d lane=%d\n", localConnId, laneId);
+  fflush(stderr);
+  auto sendBuf = serializeConnId(localConnId, laneId);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error(
         "Shared handshake client: failed to send connId");
   }
 
-  IOBufQueue readQueue;
+  IOBufQueue readQueue(IOBufQueue::cacheChainLength());
   if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
     throw std::runtime_error(
         "Shared handshake client: failed to read frame header");
@@ -516,7 +521,8 @@ ShmSharedHandshakeResult shmHandshakeClientShared(
   readQueue.trimStart(kFrameHeaderSize);
   auto payloadBuf = readQueue.move();
   uint16_t peerConnId = 0;
-  if (!deserializeConnId(payloadBuf.get(), peerConnId)) {
+  uint8_t peerLaneId = 0;
+  if (!deserializeConnId(payloadBuf.get(), peerConnId, peerLaneId)) {
     throw std::runtime_error(
         "Shared handshake client: failed to deserialize peer connId");
   }
@@ -524,16 +530,20 @@ ShmSharedHandshakeResult shmHandshakeClientShared(
   sock->close();
 
   XLOG(DBG5) << "Shared handshake client complete: localConnId="
-             << localConnId << ", peerConnId=" << peerConnId;
+             << localConnId << ", peerConnId=" << peerConnId
+             << ", laneId=" << (int)laneId;
 
-  return ShmSharedHandshakeResult{localConnId, peerConnId};
+  return ShmSharedHandshakeResult{localConnId, peerConnId, laneId};
 }
 
 ShmSharedHandshakeResult shmHandshakeServerShared(
     EventBase* evb,
     AsyncTransport* sock,
     uint16_t localConnId) {
-  IOBufQueue readQueue;
+  fprintf(stderr, "DEBUG: shmHandshakeServerShared called, localConnId=%d\n", localConnId);
+  fflush(stderr);
+  XLOG(INFO) << "shmHandshakeServerShared: starting, localConnId=" << localConnId;
+  IOBufQueue readQueue(IOBufQueue::cacheChainLength());
   if (!syncRead(evb, sock, readQueue, kFrameHeaderSize)) {
     throw std::runtime_error(
         "Shared handshake server: failed to read frame header");
@@ -552,12 +562,13 @@ ShmSharedHandshakeResult shmHandshakeServerShared(
   readQueue.trimStart(kFrameHeaderSize);
   auto payloadBuf = readQueue.move();
   uint16_t peerConnId = 0;
-  if (!deserializeConnId(payloadBuf.get(), peerConnId)) {
+  uint8_t laneId = 0;
+  if (!deserializeConnId(payloadBuf.get(), peerConnId, laneId)) {
     throw std::runtime_error(
         "Shared handshake server: failed to deserialize peer connId");
   }
 
-  auto sendBuf = serializeConnId(localConnId);
+  auto sendBuf = serializeConnId(localConnId, 0);
   if (!syncWrite(evb, sock, std::move(sendBuf))) {
     throw std::runtime_error(
         "Shared handshake server: failed to send connId");
@@ -566,9 +577,10 @@ ShmSharedHandshakeResult shmHandshakeServerShared(
   sock->close();
 
   XLOG(DBG5) << "Shared handshake server complete: localConnId="
-             << localConnId << ", peerConnId=" << peerConnId;
+             << localConnId << ", peerConnId=" << peerConnId
+             << ", laneId=" << (int)laneId;
 
-  return ShmSharedHandshakeResult{localConnId, peerConnId};
+  return ShmSharedHandshakeResult{localConnId, peerConnId, laneId};
 }
 
 } // namespace folly

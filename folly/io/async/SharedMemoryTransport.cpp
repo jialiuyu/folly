@@ -192,7 +192,7 @@ SharedMemoryTransport::UniquePtr SharedMemoryTransport::performHandshake(
 
   // Read peer's handshake info
   SharedMemoryHandshakeInfo peerInfo;
-  IOBufQueue readQueue;
+  IOBufQueue readQueue(IOBufQueue::cacheChainLength());
   bool readDone = false;
 
   class HandshakeReadCallback : public AsyncTransport::ReadCallback {

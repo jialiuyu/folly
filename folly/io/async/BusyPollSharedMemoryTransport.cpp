@@ -190,14 +190,17 @@ BusyPollSharedMemoryTransport::BusyPollSharedMemoryTransport(
     EventBase* evb,
     ShmPollerService* pollerService,
     uint16_t localConnId,
-    uint16_t peerConnId)
+    uint16_t peerConnId,
+    uint8_t laneId)
     : evb_(evb),
       pollerService_(pollerService),
       localConnId_(localConnId),
-      peerConnId_(peerConnId) {
+      peerConnId_(peerConnId),
+      laneId_(laneId) {
   state_ = State::CONNECTED;
   XLOG(DBG5) << "BusyPollSharedMemoryTransport(shared) created, localConnId="
-             << localConnId << ", peerConnId=" << peerConnId;
+             << localConnId << ", peerConnId=" << peerConnId
+             << ", laneId=" << (int)laneId;
 }
 
 BusyPollSharedMemoryTransport::UniquePtr
@@ -205,9 +208,10 @@ BusyPollSharedMemoryTransport::createShared(
     EventBase* evb,
     ShmPollerService* pollerService,
     uint16_t localConnId,
-    uint16_t peerConnId) {
+    uint16_t peerConnId,
+    uint8_t laneId) {
   return UniquePtr(new BusyPollSharedMemoryTransport(
-      evb, pollerService, localConnId, peerConnId));
+      evb, pollerService, localConnId, peerConnId, laneId));
 }
 
 // ========== Poller dispatch: onDataReceived ==========
@@ -322,7 +326,7 @@ void BusyPollSharedMemoryTransport::writeInternal(
       return;
     }
     for (auto& iov : *buf) {
-      pollerService_->writeData(peerConnId_, iov.data(), iov.size());
+      pollerService_->writeData(peerConnId_, iov.data(), iov.size(), laneId_);
       totalWritten += iov.size();
     }
     bytesWritten_ += totalWritten;

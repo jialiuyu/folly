@@ -42,6 +42,7 @@ struct ShmHandshakeResult {
 struct ShmSharedHandshakeResult {
   uint16_t localConnId{0};
   uint16_t peerConnId{0};
+  uint8_t laneId{0};
 };
 
 /**
@@ -79,13 +80,14 @@ ShmHandshakeResult shmHandshakeServer(
 
 /**
  * Client-side shared-mode handshake.
- * Exchanges connId with the server over the bootstrap socket.
+ * Exchanges connId and laneId with the server over the bootstrap socket.
  * Shared GQM / data regions are pre-initialized by ShmPollerService.
  */
 ShmSharedHandshakeResult shmHandshakeClientShared(
     EventBase* evb,
     AsyncTransport* sock,
-    uint16_t localConnId);
+    uint16_t localConnId,
+    uint8_t laneId = 0);
 
 /**
  * Server-side shared-mode handshake.

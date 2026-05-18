@@ -71,15 +71,14 @@ static constexpr size_t kControlBlockSize = 2 * kCursorSlotSize; // 128 bytes
 /**
  * ShmPollerService: shared GQM + data ring manager with poller dispatch.
  *
- * Per direction there is exactly ONE GQM queue and ONE data ring buffer,
- * shared across all connections.  One poller thread per direction pops
- * GQM entries, memcpys data into IOBufs, advances readCursor, and
- * dispatches to the correct transport via connId.
+ * Supports multi-lane architecture: each lane has independent GQM + data
+ * ring + poller thread.  Connections are assigned to a specific lane,
+ * eliminating cross-connection contention.
  *
  * Thread safety:
  *   - writeData() is called from arbitrary IO threads (thread-safe via
  *     atomic writeCursor + GQM push).
- *   - pollerLoop() runs on a dedicated thread per direction.
+ *   - pollerLoop() runs on a dedicated thread per direction per lane.
  *   - registerTransport/unregisterTransport are mutex-protected.
  *   - allocateConnId() is lock-free (atomic increment).
  */
@@ -102,6 +101,66 @@ class ShmPollerService {
     std::atomic<bool> running{false};
   };
 
+  // IOBuf buffer pool: reclaims buffers after the Thrift parser releases
+  // them, avoiding per-chunk malloc/free in the poller hot path.
+  // Thread-safe: pop() runs on poller thread, push() on arbitrary IO threads.
+  struct IOBufPool {
+    static constexpr size_t kBufSize = GqmNotification::kMaxChunkSize + 1;
+    static constexpr size_t kPoolCapacity = 128;
+
+    std::mutex mu;
+    std::vector<void*> freeList;
+
+    void* alloc() {
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!freeList.empty()) {
+          void* p = freeList.back();
+          freeList.pop_back();
+          return p;
+        }
+      }
+      return std::malloc(kBufSize);
+    }
+
+    void push(void* p) {
+      std::lock_guard<std::mutex> lk(mu);
+      if (freeList.size() < kPoolCapacity) {
+        freeList.push_back(p);
+      } else {
+        std::free(p);
+      }
+    }
+
+    ~IOBufPool() {
+      for (void* p : freeList) {
+        std::free(p);
+      }
+    }
+  };
+
+  /**
+   * Per-lane context: independent GQM + data ring + poller + IOBuf pool.
+   */
+  struct LaneContext {
+    DirectionContext writeCtx;
+    DirectionContext readCtx;
+    std::thread readPollerThread;
+    int pinnedCore{-1};
+    IOBufPool iobufPool;
+  };
+
+  /**
+   * CPU topology for poller thread pinning.
+   */
+  struct CpuTopology {
+    std::vector<int> physicalCores;
+    std::vector<int> htSiblings;
+    size_t numLogicalCpus{0};
+
+    static CpuTopology detect();
+  };
+
   ShmPollerService() = default;
   ~ShmPollerService();
 
@@ -111,7 +170,7 @@ class ShmPollerService {
   /**
    * Initialize both directions from an ImportedMemoryProvider.
    *
-   * For each direction, allocates:
+   * For each lane, allocates:
    *   1. GQM region (32KB, 4KB-aligned) from the named pool
    *   2. Data region (remaining pool space) from the named pool
    *
@@ -122,15 +181,17 @@ class ShmPollerService {
    * @param readPool  Pool name for this side's read direction
    * @param isGqmCreator  true if this side should gqm_init (typically
    *                      the side that "owns" the pool)
+   * @param numLanes  Number of independent lanes (default 1 = legacy)
    */
   void initFromProvider(
       ImportedMemoryProvider& provider,
       const std::string& writePool,
       const std::string& readPool,
-      bool isGqmCreator = true);
+      bool isGqmCreator = true,
+      uint8_t numLanes = 1);
 
   /**
-   * Start poller threads for the read direction.
+   * Start poller threads for the read direction of each lane.
    * Must be called after initFromProvider().
    */
   void startPollers();
@@ -148,11 +209,17 @@ class ShmPollerService {
   /**
    * Register a transport for dispatch.  The poller will route data
    * for this connId to the given transport on the given EventBase.
+   *
+   * @param connId    Connection identifier
+   * @param transport The shared-memory transport
+   * @param evb       EventBase for dispatch
+   * @param laneId    Lane assignment for this connection
    */
   void registerTransport(
       uint16_t connId,
       BusyPollSharedMemoryTransport* transport,
-      EventBase* evb);
+      EventBase* evb,
+      uint8_t laneId = 0);
 
   /**
    * Unregister a transport.  In-flight data for this connId will be
@@ -167,17 +234,38 @@ class ShmPollerService {
    * @param connId  Connection identifier
    * @param data    Payload pointer
    * @param len     Payload length (will be split into chunks)
+   * @param laneId  Lane to write to
    */
-  void writeData(uint16_t connId, const void* data, size_t len);
+  void writeData(
+      uint16_t connId, const void* data, size_t len, uint8_t laneId = 0);
 
   /**
-   * Access the write-direction context (for diagnostics / testing).
+   * Select a lane using round-robin.  Used during connection setup.
    */
-  DirectionContext& writeContext() { return writeCtx_; }
-  const DirectionContext& writeContext() const { return writeCtx_; }
+  uint8_t selectLane();
 
-  DirectionContext& readContext() { return readCtx_; }
-  const DirectionContext& readContext() const { return readCtx_; }
+  /**
+   * Get number of lanes.
+   */
+  uint8_t numLanes() const { return numLanes_; }
+
+  /**
+   * Access the write-direction context of a specific lane
+   * (for diagnostics / testing).
+   */
+  DirectionContext& writeContext(uint8_t laneId = 0) {
+    return lanes_.at(laneId)->writeCtx;
+  }
+  const DirectionContext& writeContext(uint8_t laneId = 0) const {
+    return lanes_.at(laneId)->writeCtx;
+  }
+
+  DirectionContext& readContext(uint8_t laneId = 0) {
+    return lanes_.at(laneId)->readCtx;
+  }
+  const DirectionContext& readContext(uint8_t laneId = 0) const {
+    return lanes_.at(laneId)->readCtx;
+  }
 
   // ========== Diagnostics ==========
 
@@ -222,11 +310,11 @@ class ShmPollerService {
   const DiagStats& diagStats() const { return diagStats_; }
 
  private:
-  static constexpr uint32_t kMaxSpinCount = 1024;
+  static constexpr uint32_t kMaxSpinCount = 64;
   static constexpr uint32_t kYieldCount = 64;
   static constexpr uint32_t kWriteTimeoutMs = 5000; // 5s backpressure timeout
 
-  void pollerLoop(DirectionContext& ctx);
+  void pollerLoop(DirectionContext& ctx, IOBufPool& pool);
 
   void initDirection(
       DirectionContext& ctx,
@@ -234,60 +322,25 @@ class ShmPollerService {
       const std::string& poolName,
       bool createGqm);
 
-  // IOBuf buffer pool: reclaims buffers after the Thrift parser releases
-  // them, avoiding per-chunk malloc/free in the poller hot path.
-  // Thread-safe: pop() runs on poller thread, push() on arbitrary IO threads.
-  struct IOBufPool {
-    static constexpr size_t kBufSize = GqmNotification::kMaxChunkSize + 1;
-    static constexpr size_t kPoolCapacity = 128;
-
-    std::mutex mu;
-    std::vector<void*> freeList;
-
-    void* alloc() {
-      {
-        std::lock_guard<std::mutex> lk(mu);
-        if (!freeList.empty()) {
-          void* p = freeList.back();
-          freeList.pop_back();
-          return p;
-        }
-      }
-      return std::malloc(kBufSize);
-    }
-
-    void push(void* p) {
-      std::lock_guard<std::mutex> lk(mu);
-      if (freeList.size() < kPoolCapacity) {
-        freeList.push_back(p);
-      } else {
-        std::free(p);
-      }
-    }
-
-    ~IOBufPool() {
-      for (void* p : freeList) {
-        std::free(p);
-      }
-    }
-  };
+  static void pinThreadToCore(std::thread& t, int coreId);
 
   static void iobufPoolDeleter(void* buf, void* ctx) {
     static_cast<IOBufPool*>(ctx)->push(buf);
   }
 
-  DirectionContext writeCtx_;
-  DirectionContext readCtx_;
+  uint8_t numLanes_{1};
+  std::vector<std::unique_ptr<LaneContext>> lanes_;
 
   struct ConnEntry {
     BusyPollSharedMemoryTransport* transport{nullptr};
     EventBase* evb{nullptr};
+    uint8_t laneId{0};
   };
   mutable std::shared_mutex connMu_;
   std::unordered_map<uint16_t, ConnEntry> connTable_;
   std::atomic<uint16_t> nextConnId_{1};
+  std::atomic<uint8_t> nextLaneId_{0};
 
-  IOBufPool iobufPool_;
   DiagStats diagStats_;
 };
 

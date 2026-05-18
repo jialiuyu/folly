@@ -116,7 +116,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
       EventBase* evb,
       ShmPollerService* pollerService,
       uint16_t localConnId,
-      uint16_t peerConnId);
+      uint16_t peerConnId,
+      uint8_t laneId = 0);
 
   ~BusyPollSharedMemoryTransport() override;
 
@@ -188,6 +189,7 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   GqmInterface* getGqmRead() { return gqmRead_.get(); }
   uint16_t localConnId() const { return localConnId_; }
   uint16_t peerConnId() const { return peerConnId_; }
+  uint8_t laneId() const { return laneId_; }
 
   struct Stats {
     uint64_t bytesWritten{0};
@@ -214,7 +216,8 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
       EventBase* evb,
       ShmPollerService* pollerService,
       uint16_t localConnId,
-      uint16_t peerConnId);
+      uint16_t peerConnId,
+      uint8_t laneId);
 
   void writeInternal(
       WriteCallback* callback,
@@ -245,6 +248,7 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   ShmPollerService* pollerService_{nullptr};
   uint16_t localConnId_{0};
   uint16_t peerConnId_{0};
+  uint8_t laneId_{0};
 
   // Flat data regions (no internal ring-buffer logic)
   std::unique_ptr<MemoryRegion> writeDataRegion_;
@@ -270,7 +274,7 @@ class BusyPollSharedMemoryTransport : public AsyncTransport {
   std::deque<WriteRequest> pendingWrites_;
   mutable std::mutex writeMutex_;
 
-  IOBufQueue readBufQueue_;
+  IOBufQueue readBufQueue_{IOBufQueue::cacheChainLength()};
 
   std::thread pollerThread_;
   std::atomic<bool> pollerRunning_{false};

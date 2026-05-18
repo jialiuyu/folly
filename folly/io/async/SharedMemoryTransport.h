@@ -307,11 +307,11 @@ class SharedMemoryTransport
   mutable std::mutex writeMutex_;
 
   // Read state
-  IOBufQueue readBufQueue_;
+  IOBufQueue readBufQueue_{IOBufQueue::cacheChainLength()};
 
   // Handshake state
   AsyncTransport::UniquePtr handshakeSocket_;
-  IOBufQueue handshakeReadBuf_;
+  IOBufQueue handshakeReadBuf_{IOBufQueue::cacheChainLength()};
   bool isServer_;
 
   // Statistics
