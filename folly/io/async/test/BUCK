@@ -296,6 +296,31 @@ non_fbcode_target(
 
 non_fbcode_target(
     _kind = folly_xplat_cxx_test,
+    name = "cxl_mem_hw_queue_test",
+    srcs = [
+        "CxlMemHWQueueTest.cpp",
+    ],
+    deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "//xplat/folly/io/async:cxl_mem_hw_queue",
+    ],
+)
+
+non_fbcode_target(
+    _kind = folly_xplat_cxx_test,
+    name = "cxl_mem_doorbell_queue_test",
+    srcs = [
+        "CxlMemDoorbellQueueTest.cpp",
+    ],
+    deps = [
+        "fbsource//xplat/folly/portability:gtest",
+        "//xplat/folly/io/async:cxl_mem_doorbell_queue",
+        "//xplat/folly/io/async:cxl_mem_hw_queue",
+    ],
+)
+
+non_fbcode_target(
+    _kind = folly_xplat_cxx_test,
     name = "event_handler_test",
     srcs = [
         "EventHandlerTest.cpp",
