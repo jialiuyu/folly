@@ -300,6 +300,25 @@ fb_dirsync_cpp_library(
 )
 
 fb_dirsync_cpp_library(
+    name = "cxl_mem_region",
+    srcs = ["CxlMemRegion.cpp"],
+    headers = ["CxlMemRegion.h"],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    exported_deps = [
+        "//folly:portability",
+    ],
+)
+
+fb_dirsync_cpp_library(
+    name = "cxl_mem_payload_slice",
+    srcs = ["CxlMemPayloadSlice.cpp"],
+    headers = ["CxlMemPayloadSlice.h"],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+)
+
+fb_dirsync_cpp_library(
     name = "certificate_identity_verifier",
     headers = ["CertificateIdentityVerifier.h"],
     use_raw_headers = True,
