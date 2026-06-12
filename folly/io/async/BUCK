@@ -319,6 +319,26 @@ fb_dirsync_cpp_library(
 )
 
 fb_dirsync_cpp_library(
+    name = "cxl_mem_async_transport",
+    srcs = ["CxlMemAsyncTransport.cpp"],
+    headers = [
+        "CxlMemAsyncTransport.h",
+        "CxlMemFrameCodec.h",
+        "CxlMemTransportConfig.h",
+    ],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    exported_deps = [
+        ":async_socket_exception",
+        ":async_transport",
+        ":cxl_mem_doorbell_queue",
+        ":cxl_mem_payload_slice",
+        "//folly:network_address",
+        "//folly/io:iobuf",
+    ],
+)
+
+fb_dirsync_cpp_library(
     name = "certificate_identity_verifier",
     headers = ["CertificateIdentityVerifier.h"],
     use_raw_headers = True,

@@ -973,6 +973,7 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
       TEST cxl_mem_doorbell_queue_test SOURCES CxlMemDoorbellQueueTest.cpp
       TEST cxl_mem_region_test SOURCES CxlMemRegionTest.cpp
       TEST cxl_mem_payload_slice_test SOURCES CxlMemPayloadSliceTest.cpp
+      TEST cxl_mem_async_transport_test SOURCES CxlMemAsyncTransportTest.cpp
       TEST io_async_async_udp_socket_test APPLE_DISABLED WINDOWS_DISABLED
         SOURCES AsyncUDPSocketTest.cpp
       TEST io_async_delayed_destruction_test SOURCES DelayedDestructionTest.cpp
