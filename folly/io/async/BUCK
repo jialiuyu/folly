@@ -339,6 +339,25 @@ fb_dirsync_cpp_library(
 )
 
 fb_dirsync_cpp_library(
+    name = "cxl_mem_poller",
+    srcs = [
+        "CxlMemPoller.cpp",
+        "CxlMemPollerGroup.cpp",
+    ],
+    headers = [
+        "CxlMemPoller.h",
+        "CxlMemPollerGroup.h",
+    ],
+    use_raw_headers = True,
+    xplat_impl = folly_xplat_cxx_library,
+    exported_deps = [
+        ":cxl_mem_doorbell_queue",
+        "//folly:function",
+        "//folly/io/async:async_base",
+    ],
+)
+
+fb_dirsync_cpp_library(
     name = "certificate_identity_verifier",
     headers = ["CertificateIdentityVerifier.h"],
     use_raw_headers = True,
