@@ -272,6 +272,8 @@ class EventBase
     Function<void()> f_;
   };
 
+  enum class NotificationQueueMode { FdWakeup, ManualPoll };
+
   struct Options {
     Options() {}
 
@@ -298,6 +300,14 @@ class EventBase
 
     Options& setBackendFactory(BackendFactory factoryFn) {
       backendFactory = std::move(factoryFn);
+      return *this;
+    }
+
+    NotificationQueueMode notificationQueueMode{
+        NotificationQueueMode::FdWakeup};
+
+    Options& setNotificationQueueMode(NotificationQueueMode mode) {
+      notificationQueueMode = mode;
       return *this;
     }
 
@@ -745,6 +755,16 @@ class EventBase
 
   size_t getNotificationQueueSize() const;
 
+  NotificationQueueMode getNotificationQueueMode() const {
+    return notificationQueueMode_;
+  }
+
+  /**
+   * Drains the runInEventBaseThread() notification queue without relying on
+   * the queue fd. Intended for EventBases configured with ManualPoll mode.
+   */
+  bool pollNotificationQueue();
+
   /**
    * Returns the number of loop callbacks pending execution. If this is
    * non-zero, loopOnce() is guaranteed to run the callbacks without blocking.
@@ -1006,6 +1026,7 @@ class EventBase
       HHWheelTimer::DEFAULT_TICK_INTERVAL};
   const bool enableTimeMeasurement_;
   const std::chrono::milliseconds loopCallbacksTimeslice_;
+  const NotificationQueueMode notificationQueueMode_;
   bool strictLoopThread_ = false;
 
   // Loop state that needs to survive suspension.

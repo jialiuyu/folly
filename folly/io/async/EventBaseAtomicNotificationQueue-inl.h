@@ -23,10 +23,16 @@ namespace folly {
 
 template <typename Task, typename Consumer>
 EventBaseAtomicNotificationQueue<Task, Consumer>::
-    EventBaseAtomicNotificationQueue(Consumer&& consumer)
+    EventBaseAtomicNotificationQueue(
+        Consumer&& consumer,
+        WakeupMode wakeupMode)
     : pid_(get_cached_pid()),
       notificationQueue_(),
-      consumer_(std::move(consumer)) {
+      consumer_(std::move(consumer)),
+      wakeupMode_(wakeupMode) {
+  if (!usesFdWakeup()) {
+    return;
+  }
 #if __has_include(<sys/eventfd.h>)
   eventfd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (eventfd_ == -1) {
@@ -85,7 +91,7 @@ EventBaseAtomicNotificationQueue<Task, Consumer>::
   unregisterHandler();
 
   // Don't drain fd in the child process.
-  if (pid_ == get_cached_pid()) {
+  if (usesFdWakeup() && pid_ == get_cached_pid()) {
     // Wait till we observe all the writes before closing fds
     while (writesObserved_ <
            (successfulArmCount_ - consumerDisarmedCount_) + writesLocal_) {
@@ -137,7 +143,7 @@ template <typename Task, typename Consumer>
 template <typename... Args>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::putMessage(
     Args&&... args) {
-  if (notificationQueue_.push(std::forward<Args>(args)...)) {
+  if (notificationQueue_.push(std::forward<Args>(args)...) && usesFdWakeup()) {
     notifyFd();
   }
 }
@@ -147,7 +153,8 @@ bool EventBaseAtomicNotificationQueue<Task, Consumer>::tryPutMessage(
     Task&& task, uint32_t maxSize) {
   auto result = notificationQueue_.tryPush(std::forward<Task>(task), maxSize);
   if (result ==
-      AtomicNotificationQueue<Task>::TryPushResult::SUCCESS_AND_ARMED) {
+          AtomicNotificationQueue<Task>::TryPushResult::SUCCESS_AND_ARMED &&
+      usesFdWakeup()) {
     notifyFd();
   }
   return result !=
@@ -178,6 +185,9 @@ template <typename Task, typename Consumer>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::startConsumingImpl(
     EventBase* evb, bool internal) {
   evb_ = evb;
+  if (!usesFdWakeup()) {
+    return;
+  }
   initHandler(
       evb_,
       folly::NetworkSocket::fromFd(eventfd_ >= 0 ? eventfd_ : pipeFds_[0]));
@@ -195,6 +205,7 @@ void EventBaseAtomicNotificationQueue<Task, Consumer>::startConsumingImpl(
 
 template <typename Task, typename Consumer>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::notifyFd() {
+  DCHECK(usesFdWakeup());
   checkPid();
 
   ssize_t bytes_written = 0;
@@ -223,6 +234,7 @@ void EventBaseAtomicNotificationQueue<Task, Consumer>::notifyFd() {
 
 template <typename Task, typename Consumer>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::drainFd() {
+  DCHECK(usesFdWakeup());
   checkPid();
 
   uint64_t message = 0;
@@ -288,15 +300,18 @@ void EventBaseAtomicNotificationQueue<Task, Consumer>::handlerReady(
 
 template <typename Task, typename Consumer>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::execute() {
-  if (!edgeTriggeredSet_) {
+  if (usesFdWakeup() && !edgeTriggeredSet_) {
     drainFd();
   }
   drive(consumer_);
-  evb_->runInLoop(this, false, nullptr);
+  if (usesFdWakeup()) {
+    evb_->runInLoop(this, false, nullptr);
+  }
 }
 
 template <typename Task, typename Consumer>
 void EventBaseAtomicNotificationQueue<Task, Consumer>::activateEvent() {
+  DCHECK(usesFdWakeup());
   if (!EventHandler::activateEvent(0)) {
     // Fallback for EventBase backends that don't support activateEvent
     ++writesLocal_;

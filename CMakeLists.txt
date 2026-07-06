@@ -969,6 +969,7 @@ if (BUILD_TESTS OR BUILD_BENCHMARKS)
       # TODO: Refactor EventHandlerTest to not use eventfd so it can work on Mac OS X.
       #TEST io_async_event_handler_test WINDOWS_DISABLED SOURCES EventHandlerTest.cpp
       TEST io_async_async_timeout_test SOURCES AsyncTimeoutTest.cpp
+      TEST io_async_busy_poll_backend_test SOURCES BusyPollBackendTest.cpp
       TEST cxl_mem_hw_queue_test SOURCES CxlMemHWQueueTest.cpp
       TEST cxl_mem_doorbell_queue_test SOURCES CxlMemDoorbellQueueTest.cpp
       TEST cxl_mem_region_test SOURCES CxlMemRegionTest.cpp

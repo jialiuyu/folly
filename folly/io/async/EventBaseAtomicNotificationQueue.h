@@ -44,7 +44,11 @@ class EventBaseAtomicNotificationQueue
       "Consumer::operator()(Task&&) should be noexcept.");
 
  public:
-  explicit EventBaseAtomicNotificationQueue(Consumer&& consumer);
+  enum class WakeupMode { FdWakeup, ManualPoll };
+
+  explicit EventBaseAtomicNotificationQueue(
+      Consumer&& consumer,
+      WakeupMode wakeupMode = WakeupMode::FdWakeup);
 
   template <
       typename C = Consumer,
@@ -125,6 +129,8 @@ class EventBaseAtomicNotificationQueue
   void execute();
 
  private:
+  bool usesFdWakeup() const { return wakeupMode_ == WakeupMode::FdWakeup; }
+
   /*
    * Adds a task to the queue without incrementing the push count.
    */
@@ -190,6 +196,7 @@ class EventBaseAtomicNotificationQueue
   ssize_t consumerDisarmedCount_{0};
   ssize_t writesObserved_{0};
   ssize_t writesLocal_{0};
+  WakeupMode wakeupMode_{WakeupMode::FdWakeup};
   bool armed_{false};
   bool edgeTriggeredSet_{false};
 };

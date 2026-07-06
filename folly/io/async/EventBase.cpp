@@ -283,6 +283,7 @@ EventBase::EventBase(Options options)
     : intervalDuration_(options.timerTickInterval),
       enableTimeMeasurement_(!options.skipTimeMeasurement),
       loopCallbacksTimeslice_(options.loopCallbacksTimeslice),
+      notificationQueueMode_(options.notificationQueueMode),
       runOnceCallbacks_(nullptr),
       stop_(false),
       queue_(nullptr),
@@ -415,6 +416,13 @@ std::unique_ptr<EventBaseBackendBase> EventBase::getTestBackend(int napiId) {
 
 size_t EventBase::getNotificationQueueSize() const {
   return queue_->size();
+}
+
+bool EventBase::pollNotificationQueue() {
+  dcheckIsInEventBaseThread();
+  auto hadTasks = !queue_->empty();
+  queue_->drain();
+  return hadTasks;
 }
 
 size_t EventBase::getNumLoopCallbacks() const {
@@ -1058,9 +1066,15 @@ bool EventBase::runLoopCallbacks() {
 }
 
 void EventBase::initNotificationQueue() {
+  auto wakeupMode = notificationQueueMode_ == NotificationQueueMode::FdWakeup
+      ? EventBaseAtomicNotificationQueue<Func, FuncRunner>::WakeupMode::
+            FdWakeup
+      : EventBaseAtomicNotificationQueue<Func, FuncRunner>::WakeupMode::
+            ManualPoll;
+
   // Infinite size queue
   queue_ = std::make_unique<EventBaseAtomicNotificationQueue<Func, FuncRunner>>(
-      FuncRunner{*this});
+      FuncRunner{*this}, wakeupMode);
 
   // Mark this as an internal event, so event_base_loop() will return if
   // there are no other events besides this one installed.
