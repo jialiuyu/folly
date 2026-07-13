@@ -360,29 +360,29 @@ poller_threads = ceil(io_threads / io_per_poller)
 
 ### folly
 
-- [ ] 新增 `HWQueue` 抽象和 backend traits。
-- [ ] 新增 `StubHWQueueBackend`，带锁模拟 4KB/496 项/8B item。
-- [ ] 新增 `RealHWQueueBackend` 接口骨架，封装真实硬件 push/pop 和 sender-side ordering。
-- [ ] 新增 `DoorbellQueue<Backend>`，支持多个 `HWQueue` 拼接。
-- [ ] 新增 DATA/ACK 分离的 queue group。
-- [ ] 新增 `CxlMemRegion` 或等价类，封装设备文件打开、offset、size、NC/CC 映射。
-- [ ] 新增 per-IO payload slice 管理。
-- [ ] 新增 `CxlMemAsyncTransport<QueueBackend>`，实现 `folly::AsyncTransport`。
+- [x] 新增 `HWQueue` 抽象和 backend traits。
+- [x] 新增 `StubHWQueueBackend`，带锁模拟 4KB/496 项/8B item。
+- [x] 新增 `RealHWQueueBackend` 接口骨架，封装真实硬件 push/pop 和 sender-side ordering。
+- [x] 新增 `DoorbellQueue<Backend>`，支持多个 `HWQueue` 拼接。
+- [x] 新增 DATA/ACK 分离的 queue group。
+- [x] 新增 `CxlMemRegion` 或等价类，封装设备文件打开、offset、size、NC/CC 映射。
+- [x] 新增 per-IO payload slice 管理。
+- [x] 新增 `CxlMemAsyncTransport<QueueBackend>`，实现 `folly::AsyncTransport`。
 - [ ] 新增 pending write queue 和 EventBase retry flush。
-- [ ] 新增 ACK 批量发布和 ACK 消费更新本地回收 cursor。
-- [ ] 新增 `PollerGroup` 和 Queue Ownership Handoff 状态机。
+- [x] 新增 ACK 批量发布和 ACK 消费更新本地回收 cursor。
+- [x] 新增 `PollerGroup` 和 Queue Ownership Handoff 状态机。
 - [ ] 新增 poller idle profile：busy/adaptive/powersave。
-- [ ] 新增单元测试：HWQueue stub 容量、DoorbellQueue 拼接、ACK 批量、pending write、ownership handoff。
+- [x] 新增单元测试：HWQueue stub 容量、DoorbellQueue 拼接、ACK 批量、pending write、ownership handoff。
 
 ### fbthrift
 
-- [ ] 在 `thrift/perf/cpp2` client 增加 `cxl_mem` transport 选择。
+- [x] 在 `thrift/perf/cpp2` client 增加 `cxl_mem` transport 选择。
 - [ ] 增加 CXL mem benchmark flags：region path、region size、IO slice size、poller threads、hwqueues per doorbell、stub/hardware backend。
-- [ ] 增加 socket 控制面握手协议。
-- [ ] 成功握手后创建 `CxlMemAsyncTransport` 并传给 `RocketClientChannel::newChannel()`。
-- [ ] server 侧增加 benchmark 专用 CXL mem 接入入口。
-- [ ] 初始化失败时 fallback 到原 Rocket socket。
-- [ ] 文档化运行命令和降级语义。
+- [x] 增加 socket 控制面握手协议。
+- [x] 成功握手后创建 `CxlMemAsyncTransport` 并传给 `RocketClientChannel::newChannel()`。
+- [x] server 侧增加 benchmark 专用 CXL mem 接入入口。
+- [x] 初始化失败时 fallback 到原 Rocket socket。
+- [x] 文档化运行命令和降级语义。
 
 ## 遗留控制表
 
